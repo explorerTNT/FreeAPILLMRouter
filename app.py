@@ -1,11 +1,6 @@
 """
 Главная точка входа приложения.
 Запускает прокси-сервер в фоне и показывает иконку в системном трее.
-
-Пользователь видит:
-- Иконку в трее (зелёная = работает)
-- Правый клик → меню (скопировать адрес, открыть конфиг, выход)
-- Всплывающие уведомления при ошибках (даже без терминала)
 """
 
 import os
@@ -15,35 +10,101 @@ import webbrowser
 import subprocess
 import platform
 import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import uvicorn
 from PIL import Image, ImageDraw
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
+
+# ====== ЛОГИРОВАНИЕ С АВТО-РОТАЦИЕЙ ======
+
+def get_base_dir() -> Path:
+    """Возвращает директорию где лежит приложение."""
+    if getattr(sys, "frozen", False):
+        exe_path = Path(sys.executable)
+        if exe_path.parts[-2] == "MacOS" and exe_path.parts[-3] == "Contents":
+            return exe_path.parent.parent.parent.parent
+        else:
+            return exe_path.parent
+    else:
+        return Path(__file__).parent
+
+
+LOG_FILE = get_base_dir() / "proxy.log"
+
+# Ротация логов:
+# - maxBytes: максимальный размер одного файла (5 МБ)
+# - backupCount: сколько старых копий хранить (3 штуки)
+#
+# Итого максимум на диске: 5 МБ × 4 файла = 20 МБ
+# Файлы: proxy.log, proxy.log.1, proxy.log.2, proxy.log.3
+# Когда proxy.log достигает 5 МБ:
+#   proxy.log.3 удаляется
+#   proxy.log.2 → proxy.log.3
+#   proxy.log.1 → proxy.log.2
+#   proxy.log   → proxy.log.1
+#   создаётся новый proxy.log
+
+file_handler = RotatingFileHandler(
+    LOG_FILE,
+    maxBytes=5 * 1024 * 1024,  # 5 МБ
+    backupCount=3,              # Хранить 3 старых файла
+    encoding="utf-8",
 )
+
+console_handler = logging.StreamHandler()
+
+# Формат логов
+log_format = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+file_handler.setFormatter(log_format)
+console_handler.setFormatter(log_format)
+
+# Настраиваем корневой логгер
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
+
 logger = logging.getLogger(__name__)
 
 
-# ====== GUI-УВЕДОМЛЕНИЯ (КРОСС-ПЛАТФОРМЕННЫЕ) ======
+# Ловим ВСЕ необработанные ошибки и пишем в лог
+def handle_exception(exc_type, exc_value, exc_traceback):
+    """Перехватывает любые необработанные исключения."""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logger.critical(
+        "Необработанная ошибка!",
+        exc_info=(exc_type, exc_value, exc_traceback),
+    )
+
+sys.excepthook = handle_exception
+
+logger.info("=" * 50)
+logger.info("Запуск приложения...")
+logger.info("Лог-файл: %s", LOG_FILE)
+logger.info("Макс. размер лога: 5 МБ × 4 файла")
+logger.info("Платформа: %s", platform.system())
+logger.info("Python: %s", sys.version)
+logger.info("Frozen: %s", getattr(sys, "frozen", False))
+logger.info("Base dir: %s", get_base_dir())
+logger.info("=" * 50)
+
+
+# ====== GUI-УВЕДОМЛЕНИЯ ======
 
 def show_message(title: str, text: str, is_error: bool = False):
-    """
-    Показывает всплывающее окно с сообщением.
-    Работает на macOS, Windows и Linux без дополнительных библиотек.
-    
-    Это нужно чтобы пользователь видел ошибки даже без терминала —
-    например, при запуске .app двойным кликом.
-    """
+    """Показывает всплывающее окно с сообщением."""
     system = platform.system()
     logger.info("Показываю уведомление: %s — %s", title, text)
 
     try:
-        if system == "Darwin":  # macOS
-            # osascript — встроенный AppleScript, есть на каждом маке
+        if system == "Darwin":
             icon_type = "stop" if is_error else "note"
             script = (
                 f'display dialog "{text}" '
@@ -55,8 +116,7 @@ def show_message(title: str, text: str, is_error: bool = False):
             subprocess.run(["osascript", "-e", script], check=False)
 
         elif system == "Windows":
-            # PowerShell с MessageBox — есть на каждой Windows
-            msg_type = "16" if is_error else "64"  # 16=Error, 64=Info
+            msg_type = "16" if is_error else "64"
             ps_script = (
                 f'Add-Type -AssemblyName System.Windows.Forms; '
                 f'[System.Windows.Forms.MessageBox]::Show('
@@ -68,23 +128,17 @@ def show_message(title: str, text: str, is_error: bool = False):
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
 
-        else:  # Linux
-            # zenity — часто предустановлен на Linux с GUI
+        else:
             msg_type = "--error" if is_error else "--info"
             subprocess.run(
                 ["zenity", msg_type, "--title", title, "--text", text],
                 check=False,
             )
     except Exception as e:
-        # Если GUI недоступен — хотя бы в лог
         logger.error("Не удалось показать уведомление: %s", e)
 
 
 def show_first_run_message(config_path: Path):
-    """
-    Показывает приветственное окно при первом запуске.
-    Объясняет пользователю что делать.
-    """
     text = (
         f"Добро пожаловать в ApiFreeLLM Proxy!\\n\\n"
         f"Создан файл конфигурации:\\n"
@@ -99,7 +153,6 @@ def show_first_run_message(config_path: Path):
 
 
 def show_no_key_message(config_path: Path):
-    """Показывает ошибку если ключ не заполнен."""
     text = (
         f"API-ключ не настроен!\\n\\n"
         f"Откройте файл:\\n"
@@ -112,7 +165,6 @@ def show_no_key_message(config_path: Path):
 
 
 def show_bad_json_message(config_path: Path):
-    """Показывает ошибку если config.json повреждён."""
     text = (
         f"Файл config.json повреждён!\\n\\n"
         f"Путь: {config_path}\\n\\n"
@@ -123,7 +175,6 @@ def show_bad_json_message(config_path: Path):
 
 
 def show_running_message(port: int):
-    """Показывает уведомление что прокси запущен."""
     text = (
         f"Прокси запущен и работает!\\n\\n"
         f"Настройки для ChatboxAI:\\n"
@@ -136,22 +187,6 @@ def show_running_message(port: int):
 
 
 # ====== ОСНОВНЫЕ ФУНКЦИИ ======
-
-def get_base_dir() -> Path:
-    """
-    Возвращает директорию где лежит приложение.
-    Работает и для python app.py, и для собранного .exe/.app.
-    """
-    if getattr(sys, "frozen", False):
-        exe_path = Path(sys.executable)
-        # macOS .app: Contents/MacOS/App → поднимаемся до папки с .app
-        if exe_path.parts[-2] == "MacOS" and exe_path.parts[-3] == "Contents":
-            return exe_path.parent.parent.parent.parent
-        else:
-            return exe_path.parent
-    else:
-        return Path(__file__).parent
-
 
 def show_config_file(config_path: Path):
     """Открывает config.json в стандартном редакторе ОС."""
@@ -168,41 +203,32 @@ def show_config_file(config_path: Path):
 
 
 def ensure_config_exists():
-    """
-    Проверяет конфигурацию с GUI-уведомлениями.
-    Возвращает config dict или None если не настроен.
-    """
+    """Проверяет конфигурацию с GUI-уведомлениями."""
     base_dir = get_base_dir()
     os.chdir(base_dir)
+    logger.info("Рабочая директория: %s", base_dir)
 
-    # Импортируем после chdir чтобы CONFIG_PATH был правильным
     from config import CONFIG_PATH, DEFAULT_CONFIG
 
-    # --- Первый запуск: файла нет ---
+    logger.info("Путь к конфигу: %s", CONFIG_PATH)
+
     if not CONFIG_PATH.exists():
         logger.info("Первый запуск — создаю config.json")
-
         from config import create_default_config
         create_default_config()
-
-        # Показываем GUI-окно с инструкцией
         show_first_run_message(CONFIG_PATH)
-
-        # Открываем файл в редакторе
         show_config_file(CONFIG_PATH)
         return None
 
-    # --- Читаем конфиг ---
     import json
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             config = json.load(f)
-    except json.JSONDecodeError:
-        logger.error("config.json повреждён")
+    except json.JSONDecodeError as e:
+        logger.error("config.json повреждён: %s", e)
         show_bad_json_message(CONFIG_PATH)
         return None
 
-    # --- Проверяем ключ ---
     api_key = config.get("api_key", "")
     if not api_key or api_key == DEFAULT_CONFIG["api_key"]:
         logger.error("API-ключ не настроен")
@@ -210,7 +236,6 @@ def ensure_config_exists():
         show_config_file(CONFIG_PATH)
         return None
 
-    # --- Дополняем недостающие поля ---
     for key, default_value in DEFAULT_CONFIG.items():
         if key not in config:
             config[key] = default_value
@@ -220,7 +245,21 @@ def ensure_config_exists():
 
 
 def create_tray_icon(color: str = "green") -> Image.Image:
-    """Создаёт иконку для трея программно."""
+    """Загружает или рисует иконку для трея."""
+    try:
+        if getattr(sys, "frozen", False):
+            base = Path(sys._MEIPASS)
+        else:
+            base = Path(__file__).parent
+
+        icon_path = base / "icon.png"
+        if icon_path.exists():
+            img = Image.open(icon_path)
+            img = img.resize((64, 64), Image.LANCZOS)
+            return img
+    except Exception as e:
+        logger.warning("Не удалось загрузить icon.png: %s", e)
+
     size = 64
     image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
@@ -267,17 +306,30 @@ def copy_to_clipboard(text: str):
 
 def run_server(host: str, port: int):
     """Запускает FastAPI-сервер в отдельном потоке."""
-    from main import app
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    try:
+        logger.info("Запускаю uvicorn на %s:%d...", host, port)
+        from main import app
+        uvicorn.run(app, host=host, port=port, log_level="info")
+    except Exception as e:
+        logger.critical("Сервер упал с ошибкой: %s", e, exc_info=True)
+        show_message(
+            "ApiFreeLLM Proxy — Ошибка",
+            f"Сервер не смог запуститься:\\n{e}",
+            is_error=True,
+        )
 
 
 def main():
     """Главная функция — запускает сервер и трей."""
-    import pystray
+    try:
+        import pystray
+    except Exception as e:
+        logger.critical("Не удалось импортировать pystray: %s", e, exc_info=True)
+        show_message("Ошибка", f"Не удалось загрузить модуль трея:\\n{e}", is_error=True)
+        return
 
     logger.info("Запуск ApiFreeLLM Proxy...")
 
-    # --- Проверяем конфиг (с GUI-уведомлениями) ---
     config = ensure_config_exists()
     if config is None:
         logger.info("Конфиг не настроен — завершаю работу.")
@@ -287,7 +339,8 @@ def main():
     port = config["server"]["port"]
     proxy_url = f"http://localhost:{port}/v1"
 
-    # --- Запускаем сервер в фоне ---
+    logger.info("Конфиг: host=%s, port=%d", host, port)
+
     server_thread = threading.Thread(
         target=run_server,
         args=(host, port),
@@ -296,17 +349,13 @@ def main():
     server_thread.start()
 
     logger.info("Сервер запущен в фоне!")
-    logger.info("Адрес: %s", proxy_url)
 
-    # --- Показываем уведомление что прокси работает ---
-    # Запускаем в отдельном потоке чтобы не блокировать трей
     threading.Thread(
         target=show_running_message,
         args=(port,),
         daemon=True,
     ).start()
 
-    # --- Меню трея ---
     def on_copy_url(icon, item):
         copy_to_clipboard(proxy_url)
 
@@ -319,6 +368,9 @@ def main():
 
     def on_open_docs(icon, item):
         webbrowser.open(f"http://localhost:{port}/docs")
+
+    def on_open_log(icon, item):
+        show_config_file(LOG_FILE)
 
     def on_quit(icon, item):
         logger.info("Завершение работы...")
@@ -335,6 +387,7 @@ def main():
         pystray.MenuItem("📋 Копировать полный эндпоинт", on_copy_endpoint),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("⚙️ Открыть config.json", on_open_config),
+        pystray.MenuItem("📄 Открыть логи", on_open_log),
         pystray.MenuItem("📖 Документация API", on_open_docs),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("❌ Выход", on_quit),
@@ -347,7 +400,7 @@ def main():
         menu=menu,
     )
 
-    logger.info("Иконка добавлена в системный трей.")
+    logger.info("Иконка добавлена в трей.")
     icon.run()
 
 
