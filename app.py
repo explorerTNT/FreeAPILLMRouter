@@ -13,6 +13,12 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+# === Защита от отсутствия консоли (Windows + PyInstaller --noconsole) ===
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 import uvicorn
 from PIL import Image, ImageDraw
 
@@ -33,29 +39,15 @@ def get_base_dir() -> Path:
 
 LOG_FILE = get_base_dir() / "proxy.log"
 
-# Ротация логов:
-# - maxBytes: максимальный размер одного файла (5 МБ)
-# - backupCount: сколько старых копий хранить (3 штуки)
-#
-# Итого максимум на диске: 5 МБ × 4 файла = 20 МБ
-# Файлы: proxy.log, proxy.log.1, proxy.log.2, proxy.log.3
-# Когда proxy.log достигает 5 МБ:
-#   proxy.log.3 удаляется
-#   proxy.log.2 → proxy.log.3
-#   proxy.log.1 → proxy.log.2
-#   proxy.log   → proxy.log.1
-#   создаётся новый proxy.log
-
 file_handler = RotatingFileHandler(
     LOG_FILE,
-    maxBytes=5 * 1024 * 1024,  # 5 МБ
-    backupCount=3,              # Хранить 3 старых файла
+    maxBytes=5 * 1024 * 1024,
+    backupCount=3,
     encoding="utf-8",
 )
 
 console_handler = logging.StreamHandler()
 
-# Формат логов
 log_format = logging.Formatter(
     "%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
@@ -63,7 +55,6 @@ log_format = logging.Formatter(
 file_handler.setFormatter(log_format)
 console_handler.setFormatter(log_format)
 
-# Настраиваем корневой логгер
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 root_logger.addHandler(file_handler)
@@ -72,7 +63,6 @@ root_logger.addHandler(console_handler)
 logger = logging.getLogger(__name__)
 
 
-# Ловим ВСЕ необработанные ошибки и пишем в лог
 def handle_exception(exc_type, exc_value, exc_traceback):
     """Перехватывает любые необработанные исключения."""
     if issubclass(exc_type, KeyboardInterrupt):
@@ -101,7 +91,7 @@ logger.info("=" * 50)
 def show_message(title: str, text: str, is_error: bool = False):
     """Показывает всплывающее окно с сообщением."""
     system = platform.system()
-    logger.info("Показываю уведомление: %s — %s", title, text)
+    logger.info("Уведомление: %s", title)
 
     try:
         if system == "Darwin":
@@ -309,7 +299,17 @@ def run_server(host: str, port: int):
     try:
         logger.info("Запускаю uvicorn на %s:%d...", host, port)
         from main import app
-        uvicorn.run(app, host=host, port=port, log_level="info")
+
+        # log_config=None — отключаем встроенное логирование uvicorn,
+        # оно падает без консоли (sys.stdout = None при --noconsole).
+        # Наш собственный логгер (RotatingFileHandler) уже работает.
+        uvicorn.run(
+            app,
+            host=host,
+            port=port,
+            log_level="info",
+            log_config=None,
+        )
     except Exception as e:
         logger.critical("Сервер упал с ошибкой: %s", e, exc_info=True)
         show_message(
