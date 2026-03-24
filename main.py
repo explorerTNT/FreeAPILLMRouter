@@ -22,18 +22,6 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
 
-from config import load_config
-
-# Загружаем конфиг до создания приложения
-config = load_config()
-
-API_KEY = config["api_key"]
-API_ENDPOINT = config["api_endpoint"]
-DEFAULT_MODEL = config["model"]
-UPSTREAM_TIMEOUT = config["upstream_timeout_seconds"]
-SERVER_HOST = config["server"]["host"]
-SERVER_PORT = config["server"]["port"]
-
 # Настраиваем логирование
 logging.basicConfig(
     level=logging.INFO,
@@ -47,6 +35,16 @@ app = FastAPI(
     description="OpenAI-совместимый прокси для ApiFreeLLM",
     version="1.0.0",
 )
+
+# ====== НАСТРОЙКИ (заполняются при старте сервера) ======
+# Не загружаем конфиг при импорте — это ломает PyInstaller сборку.
+# Конфиг загружается в on_startup когда приложение реально запускается.
+API_KEY: str = ""
+API_ENDPOINT: str = ""
+DEFAULT_MODEL: str = "apifreellm"
+UPSTREAM_TIMEOUT: int = 60
+SERVER_HOST: str = "0.0.0.0"
+SERVER_PORT: int = 8000
 
 # ====== ОЧЕРЕДЬ ЗАПРОСОВ ======
 request_lock = asyncio.Lock()
@@ -69,29 +67,23 @@ def extract_text_content(content) -> str:
     2. Массив: [{"type": "text", "text": "Привет"}, {"type": "image_url", ...}]
 
     Некоторые клиенты (CCR) всегда отправляют массив.
-    Эта функция безопасно обрабатывает оба варианта.
     """
     if content is None:
         return ""
 
-    # Формат 1: обычная строка
     if isinstance(content, str):
         return content
 
-    # Формат 2: массив объектов
     if isinstance(content, list):
         text_parts = []
         for part in content:
             if isinstance(part, dict):
-                # Берём только текстовые части, пропускаем картинки и прочее
                 if part.get("type") == "text":
                     text_parts.append(part.get("text", ""))
             elif isinstance(part, str):
-                # Иногда бывает просто массив строк
                 text_parts.append(part)
         return "\n".join(text_parts)
 
-    # На всякий случай — приводим к строке
     return str(content)
 
 
@@ -100,17 +92,13 @@ def extract_text_content(content) -> str:
 def is_title_generation_request(messages: list[dict]) -> bool:
     """
     Определяет, является ли запрос попыткой клиента сгенерировать
-    название для чата. Такие запросы содержат характерные фразы.
-
-    Поддерживает ChatboxAI, CCR и другие клиенты.
+    название для чата.
     """
     if not messages:
         return False
 
-    # Извлекаем текст безопасно — работает и со строкой, и с массивом
     last_content = extract_text_content(messages[-1].get("content", "")).lower()
 
-    # Характерные фразы из запросов разных клиентов
     title_markers = [
         # ChatboxAI
         "give this conversation a name",
@@ -138,34 +126,25 @@ def generate_smart_title(messages: list[dict]) -> str:
     """
     Генерирует осмысленное название чата локально, без API.
     Мгновенно, не тратит rate limit.
-
-    Стратегия:
-    1. Ищем текст пользователя из блока ``` ... ``` (ChatboxAI формат)
-    2. Ищем первое сообщение пользователя в массиве messages
-    3. Берём текст ответа ассистента как fallback
-    4. Если ничего не нашли — "Новый чат"
     """
     last_content = extract_text_content(messages[-1].get("content", ""))
 
-    # --- Стратегия 1: достаём текст из блока ``` ... ``` ---
+    # Стратегия 1: достаём текст из блока ``` ... ``` (ChatboxAI)
     user_text = _extract_from_code_block(last_content)
     if user_text:
         return _trim_title(user_text)
 
-    # --- Стратегия 2: ищем сообщения пользователя в массиве messages ---
+    # Стратегия 2: ищем первое сообщение пользователя в массиве (CCR)
     for msg in messages:
         role = msg.get("role", "")
         content = extract_text_content(msg.get("content", ""))
-
-        # Пропускаем системные сообщения и сам запрос на генерацию названия
         if role == "user" and content and not _is_title_instruction(content):
             return _trim_title(content)
 
-    # --- Стратегия 3: берём текст ответа ассистента ---
+    # Стратегия 3: берём ответ ассистента как fallback
     for msg in messages:
         role = msg.get("role", "")
         content = extract_text_content(msg.get("content", ""))
-
         if role == "assistant" and content:
             return _trim_title(content)
 
@@ -175,25 +154,18 @@ def generate_smart_title(messages: list[dict]) -> str:
 def _extract_from_code_block(text: str) -> str:
     """
     Достаёт первое сообщение пользователя из блока кода.
-    ChatboxAI присылает историю в формате:
-    ```
-    Привет
-    ---------
-    Ответ модели
-    ```
+    ChatboxAI присылает историю внутри ``` ... ```.
     """
     code_blocks = re.findall(r"```\s*\n(.*?)```", text, re.DOTALL)
 
     if not code_blocks:
         return ""
 
-    # Берём первый блок и первую непустую строку
     block = code_blocks[0]
     lines = block.strip().split("\n")
 
     for line in lines:
         stripped = line.strip()
-        # Пропускаем разделители и пустые строки
         if stripped and not stripped.startswith("-") and len(stripped) > 1:
             return stripped
 
@@ -222,48 +194,35 @@ def _trim_title(text: str) -> str:
     - Убирает Markdown форматирование
     - Убирает кавычки и префиксы
     """
-    # Берём только первую строку
     first_line = text.strip().split("\n")[0].strip()
 
-    # Убираем Markdown форматирование
+    # Убираем Markdown
     first_line = re.sub(r"[*_`#]", "", first_line)
 
-    # Убираем обычные кавычки по краям
-    quote_chars = "\"'`"
-    first_line = first_line.strip(quote_chars)
+    # Убираем обычные кавычки
+    first_line = first_line.strip("\"'`")
 
-    # Убираем юникодные кавычки отдельно
+    # Убираем юникодные кавычки
     unicode_quotes = [
-        "\u00ab",  # «
-        "\u00bb",  # »
-        "\u201e",  # „
-        "\u201c",  # "
-        "\u201d",  # "
-        "\u2018",  # '
-        "\u2019",  # '
+        "\u00ab", "\u00bb",  # « »
+        "\u201e", "\u201c", "\u201d",  # „ " "
+        "\u2018", "\u2019",  # ' '
     ]
     for char in unicode_quotes:
         first_line = first_line.strip(char)
 
-    # Убираем префиксы ролей если есть
-    role_prefixes = ["User:", "user:", "Human:", "human:"]
-    for prefix in role_prefixes:
+    # Убираем префиксы ролей
+    for prefix in ["User:", "user:", "Human:", "human:"]:
         if first_line.startswith(prefix):
             first_line = first_line[len(prefix):].strip()
 
     # Обрезаем до 6 слов
     words = first_line.split()
+    title = " ".join(words[:6]) + ("..." if len(words) > 6 else "")
 
-    if len(words) <= 6:
-        title = " ".join(words)
-    else:
-        title = " ".join(words[:6]) + "..."
-
-    # Если слишком коротко или пусто
     if len(title) < 2:
         return "Новый чат"
 
-    # Ограничиваем длину в символах
     if len(title) > 50:
         title = title[:47] + "..."
 
@@ -273,12 +232,7 @@ def _trim_title(text: str) -> str:
 # ====== СТРИМИНГ (SSE) ======
 
 def create_stream_chunk(content: str, model: str, finish_reason: str = None) -> str:
-    """
-    Формирует один чанк SSE-ответа в формате OpenAI.
-
-    ChatboxAI и CCR ожидают именно такой формат — без него
-    клиент не может прочитать ответ модели.
-    """
+    """Формирует один чанк SSE-ответа в формате OpenAI."""
     chunk = {
         "id": generate_completion_id(),
         "object": "chat.completion.chunk",
@@ -300,11 +254,7 @@ def create_stream_chunk(content: str, model: str, finish_reason: str = None) -> 
 
 
 async def stream_response(text: str, model: str):
-    """
-    Генератор SSE-ответа — отдаёт текст по частям,
-    имитируя стриминг как у OpenAI.
-    """
-    # Первый чанк — роль ассистента
+    """Генератор SSE-ответа — отдаёт текст по частям."""
     first_chunk = {
         "id": generate_completion_id(),
         "object": "chat.completion.chunk",
@@ -320,17 +270,13 @@ async def stream_response(text: str, model: str):
     }
     yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
 
-    # Разбиваем текст на куски по ~5 символов
     chunk_size = 5
     for i in range(0, len(text), chunk_size):
         piece = text[i:i + chunk_size]
         yield create_stream_chunk(piece, model)
         await asyncio.sleep(0.02)
 
-    # Финальный чанк
     yield create_stream_chunk("", model, finish_reason="stop")
-
-    # Маркер конца потока
     yield "data: [DONE]\n\n"
 
 
@@ -399,9 +345,7 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
                     retry_after = RATE_LIMIT_INTERVAL
 
                 if attempt < MAX_RETRIES:
-                    logger.warning(
-                        "Rate limit (429). Жду %d сек...", retry_after
-                    )
+                    logger.warning("Rate limit (429). Жду %d сек...", retry_after)
                     await asyncio.sleep(retry_after)
                     last_request_time = time.monotonic()
                     continue
@@ -453,6 +397,24 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
 
 @app.on_event("startup")
 async def on_startup():
+    """
+    Загружаем конфиг здесь, а не при импорте модуля.
+    Это критично для PyInstaller — при сборке модуль импортируется
+    без реального запуска сервера, и config.json может не существовать.
+    """
+    global API_KEY, API_ENDPOINT, DEFAULT_MODEL, UPSTREAM_TIMEOUT, SERVER_HOST, SERVER_PORT
+
+    from config import load_config
+    config = load_config()
+
+    # Заполняем глобальные переменные из конфига
+    API_KEY = config["api_key"]
+    API_ENDPOINT = config["api_endpoint"]
+    DEFAULT_MODEL = config["model"]
+    UPSTREAM_TIMEOUT = config["upstream_timeout_seconds"]
+    SERVER_HOST = config["server"]["host"]
+    SERVER_PORT = config["server"]["port"]
+
     logger.info("=" * 50)
     logger.info("Сервер запущен!")
     logger.info("Прокси: http://%s:%d", SERVER_HOST, SERVER_PORT)
@@ -479,7 +441,6 @@ def build_prompt_from_messages(messages: list[dict]) -> str:
     parts = []
     for msg in messages:
         role = msg.get("role", "user")
-        # Используем безопасное извлечение — работает и со строкой, и с массивом
         content = extract_text_content(msg.get("content", ""))
         label = role_labels.get(role, role.capitalize())
         parts.append(f"{label}: {content}")
@@ -513,11 +474,7 @@ async def proxy_chat(request: Request):
     # --- Генерация названия чата (мгновенно, без API) ---
     if is_title_generation_request(messages):
         title = generate_smart_title(messages)
-        logger.info(
-            "[#%d] Название чата -> '%s'",
-            req_id,
-            title,
-        )
+        logger.info("[#%d] Название чата -> '%s'", req_id, title)
 
         if use_stream:
             return StreamingResponse(
@@ -595,9 +552,11 @@ async def health_check():
 
 
 if __name__ == "__main__":
+    from config import load_config
+    config = load_config()
     uvicorn.run(
         "main:app",
-        host=SERVER_HOST,
-        port=SERVER_PORT,
+        host=config["server"]["host"],
+        port=config["server"]["port"],
         log_level="info",
     )
