@@ -311,15 +311,13 @@ def run_server(host: str, port: int):
         logger.info("Запускаю uvicorn на %s:%d...", host, port)
         from main import app
 
-        # log_config=None — отключаем встроенное логирование uvicorn,
-        # оно падает без консоли (sys.stdout = None при --noconsole).
-        # Наш собственный логгер (RotatingFileHandler) уже работает.
         uvicorn.run(
             app,
             host=host,
             port=port,
             log_level="info",
             log_config=None,
+            access_log=False,  # ← Добавь эту строку
         )
     except Exception as e:
         logger.critical("Сервер упал с ошибкой: %s", e, exc_info=True)
@@ -328,7 +326,6 @@ def run_server(host: str, port: int):
             f"Сервер не смог запуститься:\\n{e}",
             is_error=True,
         )
-
 
 def main():
     """Главная функция — запускает сервер и трей."""

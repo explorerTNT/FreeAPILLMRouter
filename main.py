@@ -8,20 +8,25 @@
 - Умная генерация названий чатов (мгновенно, без API)
 - Поддержка мультимодального формата content (строка и массив)
 - Автоповтор при 429
+- Подсчёт использованных токенов (приблизительный)
+- Умное сжатие контекста при превышении 32k токенов
+- Веб-панель мониторинга с реальной статистикой
 """
 
 import asyncio
 import itertools
 import json
 import re
+import statistics
 import time
 import uuid
 import logging
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 import httpx
 
 # Настраиваем логирование
@@ -34,8 +39,6 @@ logger = logging.getLogger(__name__)
 
 
 # ====== НАСТРОЙКИ (заполняются при старте сервера) ======
-# Не загружаем конфиг при импорте — это ломает PyInstaller сборку.
-# Конфиг загружается в lifespan когда приложение реально запускается.
 API_KEY: str = ""
 API_ENDPOINT: str = ""
 DEFAULT_MODEL: str = "apifreellm"
@@ -49,26 +52,140 @@ last_request_time: float = 0.0
 RATE_LIMIT_INTERVAL = 25
 MAX_RETRIES = 3
 
-# Переиспользуемый HTTP-клиент — создаётся один раз при старте.
-# Экономит ~200-500мс на каждом запросе (не нужно заново устанавливать
-# TCP-соединение и проходить TLS-рукопожатие).
+# Переиспользуемый HTTP-клиент
 http_client: httpx.AsyncClient | None = None
 
-# Потокобезопасный счётчик запросов.
-# itertools.count — атомарный, не сломается если uvicorn запустит
-# несколько воркеров или задачи переключатся между await.
+# Потокобезопасный счётчик запросов
 _request_id_generator = itertools.count(1)
+
+# ====== ЛИМИТ КОНТЕКСТА ======
+CONTEXT_LIMIT_TOKENS = 32_000
+RESPONSE_RESERVE_TOKENS = 4_000
+MAX_PROMPT_TOKENS = CONTEXT_LIMIT_TOKENS - RESPONSE_RESERVE_TOKENS
+
+
+# ====== ПОДСЧЁТ ТОКЕНОВ ======
+
+def estimate_tokens(text: str) -> int:
+    """
+    Приблизительная оценка количества токенов в тексте.
+    Кириллица дороже (~2 символа/токен), латиница (~4 символа/токен).
+    """
+    if not text:
+        return 0
+
+    cyrillic_count = sum(1 for ch in text if '\u0400' <= ch <= '\u04ff')
+    total_chars = len(text)
+
+    if total_chars == 0:
+        return 0
+
+    cyrillic_ratio = cyrillic_count / total_chars
+    chars_per_token = 2.0 * cyrillic_ratio + 4.0 * (1.0 - cyrillic_ratio)
+    estimated = int(total_chars / chars_per_token * 1.1)
+
+    return max(estimated, 1)
+
+
+# ====== СТАТИСТИКА ======
+
+@dataclass
+class ProxyStats:
+    """Статистика работы прокси-сервера."""
+    total_requests: int = 0
+    successful_requests: int = 0
+    failed_requests: int = 0
+    title_requests_filtered: int = 0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    response_times: list[float] = field(default_factory=list)
+    context_truncations: int = 0
+    start_time: float = field(default_factory=time.time)
+
+    def record_success(
+        self,
+        response_time: float,
+        prompt_tokens: int,
+        completion_tokens: int,
+    ) -> None:
+        self.total_requests += 1
+        self.successful_requests += 1
+        self.total_prompt_tokens += prompt_tokens
+        self.total_completion_tokens += completion_tokens
+        self.response_times.append(response_time)
+        if len(self.response_times) > 100:
+            self.response_times.pop(0)
+
+    def record_failure(self) -> None:
+        self.total_requests += 1
+        self.failed_requests += 1
+
+    def record_title_filtered(self) -> None:
+        self.total_requests += 1
+        self.title_requests_filtered += 1
+
+    def record_truncation(self) -> None:
+        self.context_truncations += 1
+
+    @property
+    def total_tokens(self) -> int:
+        return self.total_prompt_tokens + self.total_completion_tokens
+
+    @property
+    def avg_response_time(self) -> float:
+        if not self.response_times:
+            return 0.0
+        return statistics.mean(self.response_times)
+
+    @property
+    def uptime_seconds(self) -> float:
+        return time.time() - self.start_time
+
+    def to_dict(self) -> dict:
+        return {
+            "uptime_seconds": round(self.uptime_seconds, 1),
+            "uptime_human": _format_duration(self.uptime_seconds),
+            "total_requests": self.total_requests,
+            "successful": self.successful_requests,
+            "failed": self.failed_requests,
+            "title_filtered": self.title_requests_filtered,
+            "tokens": {
+                "prompt": self.total_prompt_tokens,
+                "completion": self.total_completion_tokens,
+                "total": self.total_tokens,
+                "total_human": _format_tokens(self.total_tokens),
+            },
+            "context_truncations": self.context_truncations,
+            "avg_response_time_seconds": round(self.avg_response_time, 2),
+            "rate_limit_interval": RATE_LIMIT_INTERVAL,
+            "context_limit_tokens": CONTEXT_LIMIT_TOKENS,
+        }
+
+
+def _format_duration(seconds: float) -> str:
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    if hours > 0:
+        return f"{hours}ч {minutes}м {secs}с"
+    if minutes > 0:
+        return f"{minutes}м {secs}с"
+    return f"{secs}с"
+
+
+def _format_tokens(tokens: int) -> str:
+    if tokens < 1000:
+        return str(tokens)
+    return f"{tokens / 1000:.1f}k"
+
+
+proxy_stats = ProxyStats()
 
 
 # ====== ЖИЗНЕННЫЙ ЦИКЛ ПРИЛОЖЕНИЯ ======
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    """
-    Управление жизненным циклом приложения.
-    Код до yield выполняется при запуске сервера.
-    Код после yield выполняется при остановке.
-    """
     global API_KEY, API_ENDPOINT, DEFAULT_MODEL
     global UPSTREAM_TIMEOUT, SERVER_HOST, SERVER_PORT
     global http_client
@@ -76,7 +193,6 @@ async def lifespan(application: FastAPI):
     from config import load_config
     config = load_config()
 
-    # Заполняем глобальные переменные из конфига
     API_KEY = config["api_key"]
     API_ENDPOINT = config["api_endpoint"]
     DEFAULT_MODEL = config["model"]
@@ -84,7 +200,6 @@ async def lifespan(application: FastAPI):
     SERVER_HOST = config["server"]["host"]
     SERVER_PORT = config["server"]["port"]
 
-    # Создаём HTTP-клиент один раз на всё время жизни сервера.
     http_client = httpx.AsyncClient(
         timeout=UPSTREAM_TIMEOUT,
         limits=httpx.Limits(
@@ -97,26 +212,28 @@ async def lifespan(application: FastAPI):
     logger.info("Сервер запущен!")
     logger.info("Прокси: http://%s:%d", SERVER_HOST, SERVER_PORT)
     logger.info("Upstream: %s", API_ENDPOINT)
-    logger.info("Rate limit: 1 запрос / %d сек", RATE_LIMIT_INTERVAL)
-    logger.info("Фильтрация мусорных запросов: ВКЛ")
-    logger.info("Поддержка стриминга (SSE): ВКЛ")
-    logger.info("Совместимость с CCR: ВКЛ")
+    logger.info("Rate limit: %dс | Контекст: %dk (резерв %dk)",
+                RATE_LIMIT_INTERVAL,
+                CONTEXT_LIMIT_TOKENS // 1000,
+                RESPONSE_RESERVE_TOKENS // 1000)
+    logger.info("Дашборд: http://localhost:%d/", SERVER_PORT)
     logger.info("Документация: http://localhost:%d/docs", SERVER_PORT)
     logger.info("=" * 50)
 
-    yield  # ← Сервер работает, обрабатывает запросы
+    yield
 
-    # Код ниже выполняется при остановке сервера
     if http_client:
         await http_client.aclose()
-        logger.info("HTTP-клиент закрыт.")
-    logger.info("Сервер остановлен.")
+
+    logger.info("Сессия завершена: %d запросов, ~%s токенов",
+                proxy_stats.total_requests,
+                _format_tokens(proxy_stats.total_tokens))
 
 
 app = FastAPI(
     title="ApiFreeLLM Proxy",
     description="OpenAI-совместимый прокси для ApiFreeLLM",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -124,21 +241,10 @@ app = FastAPI(
 # ====== ИЗВЛЕЧЕНИЕ ТЕКСТА ИЗ CONTENT ======
 
 def extract_text_content(content) -> str:
-    """
-    Извлекает текст из поля content сообщения.
-
-    OpenAI API поддерживает два формата:
-    1. Строка: "Привет"
-    2. Массив: [{"type": "text", "text": "Привет"}, {"type": "image_url", ...}]
-
-    Некоторые клиенты (CCR) всегда отправляют массив.
-    """
     if content is None:
         return ""
-
     if isinstance(content, str):
         return content
-
     if isinstance(content, list):
         text_parts = []
         for part in content:
@@ -148,83 +254,52 @@ def extract_text_content(content) -> str:
             elif isinstance(part, str):
                 text_parts.append(part)
         return "\n".join(text_parts)
-
     return str(content)
 
 
 # ====== ФИЛЬТРАЦИЯ И ГЕНЕРАЦИЯ НАЗВАНИЙ ЧАТОВ ======
 
 def is_title_generation_request(messages: list[dict]) -> bool:
-    """
-    Определяет, является ли запрос попыткой клиента сгенерировать
-    название для чата.
-
-    [ИСПРАВЛЕНО] Добавлена проверка длины сообщения.
-    Настоящие запросы на генерацию названия — это короткие инструкции
-    (обычно до 500 символов). Если сообщение длиннее — это обычный
-    запрос пользователя, внутри которого случайно встретился маркер
-    (например, пользователь отправил исходный код на ревью, и в коде
-    есть строки-маркеры вроде "give this conversation a name").
-    """
     if not messages:
         return False
 
     last_msg = messages[-1]
     last_content = extract_text_content(last_msg.get("content", ""))
 
-    # --- Защита от ложных срабатываний ---
-    # Запрос на генерацию названия — это короткая инструкция от клиента.
-    # Если сообщение длиннее 1000 символов — это точно НЕ запрос на название,
-    # а обычное сообщение пользователя (возможно, с кодом внутри).
-    # 1000 символов — с большим запасом, реальные запросы обычно до 500.
     if len(last_content) > 1000:
         return False
 
     last_content_lower = last_content.lower()
 
     title_markers = [
-        # ChatboxAI
         "give this conversation a name",
         "give a short name",
         "name this conversation",
         "conversation a name",
         "provide the name, nothing else",
-        # CCR
         "create a concise title",
         "short title",
         "title for this chat",
-        # Общие
         "summarize this conversation",
         "generate a title",
     ]
 
-    for marker in title_markers:
-        if marker in last_content_lower:
-            return True
-
-    return False
+    return any(marker in last_content_lower for marker in title_markers)
 
 
 def generate_smart_title(messages: list[dict]) -> str:
-    """
-    Генерирует осмысленное название чата локально, без API.
-    Мгновенно, не тратит rate limit.
-    """
     last_content = extract_text_content(messages[-1].get("content", ""))
 
-    # Стратегия 1: достаём текст из блока ``` ... ``` (ChatboxAI)
     user_text = _extract_from_code_block(last_content)
     if user_text:
         return _trim_title(user_text)
 
-    # Стратегия 2: ищем первое сообщение пользователя в массиве (CCR)
     for msg in messages:
         role = msg.get("role", "")
         content = extract_text_content(msg.get("content", ""))
         if role == "user" and content and not _is_title_instruction(content):
             return _trim_title(content)
 
-    # Стратегия 3: берём ответ ассистента как fallback
     for msg in messages:
         role = msg.get("role", "")
         content = extract_text_content(msg.get("content", ""))
@@ -235,28 +310,19 @@ def generate_smart_title(messages: list[dict]) -> str:
 
 
 def _extract_from_code_block(text: str) -> str:
-    """
-    Достаёт первое сообщение пользователя из блока кода.
-    ChatboxAI присылает историю внутри ``` ... ```.
-    """
     code_blocks = re.findall(r"```\s*\n(.*?)```", text, re.DOTALL)
-
     if not code_blocks:
         return ""
-
     block = code_blocks[0]
     lines = block.strip().split("\n")
-
     for line in lines:
         stripped = line.strip()
         if stripped and not stripped.startswith("-") and len(stripped) > 1:
             return stripped
-
     return ""
 
 
 def _is_title_instruction(text: str) -> bool:
-    """Проверяет, является ли текст инструкцией для генерации названия."""
     lower = text.lower()
     instruction_markers = [
         "give this conversation a name",
@@ -271,62 +337,129 @@ def _is_title_instruction(text: str) -> bool:
 
 
 def _trim_title(text: str) -> str:
-    """
-    Обрезает текст до красивого названия чата.
-    - Максимум 6 слов
-    - Убирает Markdown форматирование
-    - Убирает кавычки и префиксы
-    """
     first_line = text.strip().split("\n")[0].strip()
-
-    # Убираем Markdown
     first_line = re.sub(r"[*_`#]", "", first_line)
-
-    # Убираем обычные кавычки
     first_line = first_line.strip("\"'`")
 
-    # Убираем юникодные кавычки
-    unicode_quotes = [
-        "\u00ab", "\u00bb",  # « »
-        "\u201e", "\u201c", "\u201d",  # „ " "
-        "\u2018", "\u2019",  # ' '
-    ]
-    for char in unicode_quotes:
+    for char in ["\u00ab", "\u00bb", "\u201e", "\u201c", "\u201d",
+                 "\u2018", "\u2019"]:
         first_line = first_line.strip(char)
 
-    # Убираем префиксы ролей
     for prefix in ["User:", "user:", "Human:", "human:"]:
         if first_line.startswith(prefix):
             first_line = first_line[len(prefix):].strip()
 
-    # Обрезаем до 6 слов
     words = first_line.split()
     title = " ".join(words[:6]) + ("..." if len(words) > 6 else "")
 
     if len(title) < 2:
         return "Новый чат"
-
     if len(title) > 50:
         title = title[:47] + "..."
-
     return title
+
+
+# ====== УМНОЕ СЖАТИЕ КОНТЕКСТА ======
+
+def trim_messages_to_fit(messages: list[dict], max_tokens: int) -> list[dict]:
+    """
+    Обрезает историю сообщений чтобы уложиться в лимит токенов.
+    Приоритет: system prompt > последний вопрос > свежие сообщения > старые.
+    """
+    if not messages:
+        return messages
+
+    msg_tokens = []
+    for msg in messages:
+        content = extract_text_content(msg.get("content", ""))
+        msg_tokens.append(estimate_tokens(content))
+
+    total_tokens = sum(msg_tokens)
+
+    if total_tokens <= max_tokens:
+        return messages
+
+    # Контекст не влезает — обрезаем
+    proxy_stats.record_truncation()
+    logger.info("Контекст: ~%d > %d токенов — обрезаю", total_tokens, max_tokens)
+
+    # Системные сообщения — всегда оставляем
+    system_msgs = []
+    system_tokens = 0
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "system":
+            system_msgs.append(msg)
+            system_tokens += msg_tokens[i]
+
+    # Последний вопрос пользователя — всегда оставляем
+    last_user_msg = None
+    last_user_tokens = 0
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            last_user_msg = messages[i]
+            last_user_tokens = msg_tokens[i]
+            break
+
+    reserved_tokens = system_tokens + last_user_tokens + 50
+
+    if reserved_tokens >= max_tokens:
+        logger.warning("System + вопрос не влезают (%d > %d), отправляю только вопрос",
+                        reserved_tokens, max_tokens)
+        if last_user_msg:
+            return [last_user_msg]
+        return [messages[-1]]
+
+    # Собираем диалог (без system), берём с конца сколько влезет
+    remaining_budget = max_tokens - reserved_tokens
+
+    dialogue_msgs = []
+    dialogue_tokens_list = []
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "system":
+            continue
+        dialogue_msgs.append(msg)
+        dialogue_tokens_list.append(msg_tokens[i])
+
+    kept_msgs = []
+    kept_tokens = 0
+    for i in range(len(dialogue_msgs) - 1, -1, -1):
+        if dialogue_msgs[i] is last_user_msg:
+            continue
+        if kept_tokens + dialogue_tokens_list[i] > remaining_budget:
+            break
+        kept_msgs.insert(0, dialogue_msgs[i])
+        kept_tokens += dialogue_tokens_list[i]
+
+    trimmed_count = len(dialogue_msgs) - len(kept_msgs) - 1
+
+    result = list(system_msgs)
+
+    if trimmed_count > 0:
+        result.append({
+            "role": "system",
+            "content": (
+                f"[{trimmed_count} предыдущих сообщений опущены "
+                f"из-за ограничения контекста.]"
+            ),
+        })
+
+    result.extend(kept_msgs)
+
+    if last_user_msg and last_user_msg not in result:
+        result.append(last_user_msg)
+
+    logger.info("Обрезано: %d→%d сообщений, удалено %d",
+                len(messages), len(result), trimmed_count)
+
+    return result
 
 
 # ====== СТРИМИНГ (SSE) ======
 
 async def stream_response(text: str, model: str):
-    """
-    Генератор SSE-ответа — отдаёт текст по частям.
-
-    Все чанки одного ответа имеют одинаковый id и created —
-    это требование спецификации OpenAI. Без этого некоторые
-    клиенты (ChatboxAI, CCR) могут некорректно группировать чанки.
-    """
-    # Один ID и timestamp на весь ответ
     completion_id = generate_completion_id()
     created = int(time.time())
 
-    # Первый чанк — сообщает клиенту роль ассистента
     first_chunk = {
         "id": completion_id,
         "object": "chat.completion.chunk",
@@ -338,46 +471,49 @@ async def stream_response(text: str, model: str):
             "finish_reason": None,
         }],
     }
-    yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
 
-    # Основные чанки с текстом
-    chunk_size = 5
-    for i in range(0, len(text), chunk_size):
-        piece = text[i:i + chunk_size]
-        content_chunk = {
+    try:
+        yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
+
+        chunk_size = 5
+        for i in range(0, len(text), chunk_size):
+            piece = text[i:i + chunk_size]
+            content_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": piece},
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(content_chunk, ensure_ascii=False)}\n\n"
+            await asyncio.sleep(0.02)
+
+        stop_chunk = {
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
             "choices": [{
                 "index": 0,
-                "delta": {"content": piece},
-                "finish_reason": None,
+                "delta": {},
+                "finish_reason": "stop",
             }],
         }
-        yield f"data: {json.dumps(content_chunk, ensure_ascii=False)}\n\n"
-        await asyncio.sleep(0.02)
+        yield f"data: {json.dumps(stop_chunk, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
 
-    # Финальный чанк — сигнал клиенту что ответ завершён
-    stop_chunk = {
-        "id": completion_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": {},
-            "finish_reason": "stop",
-        }],
-    }
-    yield f"data: {json.dumps(stop_chunk, ensure_ascii=False)}\n\n"
-    yield "data: [DONE]\n\n"
+    except asyncio.CancelledError:
+        logger.info("Клиент отключился во время стриминга")
+        return
 
 
 # ====== UPSTREAM ======
 
 async def wait_for_rate_limit() -> None:
-    """Ждёт нужное время перед следующим запросом к ApiFreeLLM."""
     global last_request_time
 
     now = time.monotonic()
@@ -385,38 +521,22 @@ async def wait_for_rate_limit() -> None:
     wait_time = RATE_LIMIT_INTERVAL - elapsed
 
     if wait_time > 0:
-        logger.info("Ожидание rate limit: %.1f сек...", wait_time)
+        logger.info("Rate limit: ожидание %.0f сек...", wait_time)
         await asyncio.sleep(wait_time)
 
 
 async def send_to_upstream(prompt: str, model: str) -> dict:
-    """Отправляет запрос к ApiFreeLLM с очередью и повторами."""
     global last_request_time
 
     async with request_lock:
         for attempt in range(1, MAX_RETRIES + 1):
             await wait_for_rate_limit()
 
-            logger.info(
-                "Отправляю запрос к ApiFreeLLM (попытка %d/%d)...",
-                attempt,
-                MAX_RETRIES,
-            )
-
-            # Логируем начало и конец промпта.
-            prompt_len = len(prompt)
-            if prompt_len > 400:
-                prompt_preview = (
-                    f"{prompt[:200]}\n"
-                    f"... [{prompt_len} символов всего] ...\n"
-                    f"{prompt[-200:]}"
-                )
-            else:
-                prompt_preview = prompt
-            logger.info("Промпт (%d символов):\n%s", prompt_len, prompt_preview)
+            # Логируем попытку только если это повтор (retry)
+            if attempt > 1:
+                logger.info("Повторная попытка %d/%d...", attempt, MAX_RETRIES)
 
             try:
-                # Используем глобальный http_client
                 response = await http_client.post(
                     API_ENDPOINT,
                     headers={
@@ -429,7 +549,7 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
                     },
                 )
             except httpx.TimeoutException:
-                logger.error("Таймаут (%ds)", UPSTREAM_TIMEOUT)
+                logger.error("Таймаут (%dс)", UPSTREAM_TIMEOUT)
                 raise HTTPException(
                     status_code=504,
                     detail=f"ApiFreeLLM не ответил за {UPSTREAM_TIMEOUT} секунд.",
@@ -451,23 +571,20 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
                     retry_after = RATE_LIMIT_INTERVAL
 
                 if attempt < MAX_RETRIES:
-                    logger.warning("Rate limit (429). Жду %d сек...", retry_after)
+                    logger.warning("429 Rate limit, жду %dс...", retry_after)
                     await asyncio.sleep(retry_after)
                     last_request_time = time.monotonic()
                     continue
                 else:
-                    logger.error("Rate limit: все попытки исчерпаны.")
+                    logger.error("429: все %d попыток исчерпаны", MAX_RETRIES)
                     raise HTTPException(
                         status_code=429,
                         detail="ApiFreeLLM перегружен. Попробуйте через 30 секунд.",
                     )
 
             if response.status_code != 200:
-                logger.error(
-                    "Upstream ошибка: %d — %s",
-                    response.status_code,
-                    response.text,
-                )
+                logger.error("Upstream %d: %s",
+                             response.status_code, response.text[:200])
                 raise HTTPException(
                     status_code=response.status_code,
                     detail=f"Ошибка от ApiFreeLLM ({response.status_code}): "
@@ -477,37 +594,20 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
             try:
                 result_json = response.json()
             except Exception:
-                logger.error("Невалидный JSON: %s", response.text)
+                logger.error("Невалидный JSON от upstream")
                 raise HTTPException(
                     status_code=502,
                     detail="ApiFreeLLM вернул невалидный JSON.",
                 )
 
             if not result_json.get("success", False):
-                logger.warning("success=false: %s", result_json)
+                logger.warning("success=false от upstream")
                 raise HTTPException(
                     status_code=502,
                     detail="ApiFreeLLM сообщил об ошибке.",
                 )
 
-            output_text = result_json.get("response", "")
-
-            # Логируем тело ответа
-            if len(output_text) > 1000:
-                logger.info(
-                    "Ответ (%d символов):\n%s\n... [обрезано для лога] ...\n%s",
-                    len(output_text),
-                    output_text[:500],
-                    output_text[-200:],
-                )
-            else:
-                logger.info(
-                    "Ответ (%d символов):\n%s",
-                    len(output_text),
-                    output_text,
-                )
-
-            return {"text": output_text}
+            return {"text": result_json.get("response", "")}
 
     raise HTTPException(status_code=500, detail="Неожиданная ошибка.")
 
@@ -515,12 +615,6 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
 # ====== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======
 
 def build_prompt_from_messages(messages: list[dict]) -> str:
-    """
-    Склеивает массив сообщений OpenAI-формата в один промпт.
-
-    ApiFreeLLM принимает одну строку в поле "message",
-    поэтому нам нужно объединить всю историю диалога.
-    """
     if not messages:
         return ""
 
@@ -537,33 +631,23 @@ def build_prompt_from_messages(messages: list[dict]) -> str:
         content = extract_text_content(msg.get("content", ""))
 
         if not content.strip():
-            # Пропускаем пустые сообщения — они только засоряют промпт
             continue
 
         if role == "system":
-            # Системные сообщения собираем отдельно —
-            # они должны быть в начале как инструкция для модели
             system_parts.append(content)
         else:
             label = role_labels.get(role, role.capitalize())
             dialogue_parts.append(f"{label}: {content}")
 
-    # Если одно сообщение от user и нет system —
-    # отправляем без обёрток. Модель лучше понимает
-    # чистый текст чем "User: текст".
     if not system_parts and len(dialogue_parts) == 1:
         single_msg = dialogue_parts[0]
         if single_msg.startswith("User: "):
-            return single_msg[6:]  # len("User: ") == 6
+            return single_msg[6:]
         return single_msg
 
-    # Собираем финальный промпт
     parts = []
-
     if system_parts:
-        # Явно помечаем как системную инструкцию
         parts.append("[System instruction]\n" + "\n".join(system_parts))
-
     if dialogue_parts:
         parts.append("\n\n".join(dialogue_parts))
 
@@ -571,15 +655,270 @@ def build_prompt_from_messages(messages: list[dict]) -> str:
 
 
 def generate_completion_id() -> str:
-    """Генерирует уникальный ID ответа в формате OpenAI."""
     return f"chatcmpl-{uuid.uuid4().hex[:12]}"
+
+
+# ====== ВЕБ-ДАШБОРД ======
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ApiFreeLLM Proxy</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI',
+                         Roboto, 'Helvetica Neue', sans-serif;
+            background: #0f0f1a;
+            color: #e0e0e0;
+            min-height: 100vh;
+            padding: 24px;
+        }
+
+        .container { max-width: 720px; margin: 0 auto; }
+
+        header { text-align: center; margin-bottom: 32px; }
+        header h1 { font-size: 28px; color: #fff; margin-bottom: 8px; }
+
+        .status-badge {
+            display: inline-flex; align-items: center; gap: 8px;
+            background: rgba(76, 175, 80, 0.15);
+            border: 1px solid rgba(76, 175, 80, 0.3);
+            border-radius: 20px; padding: 6px 16px;
+            font-size: 14px; color: #4caf50;
+        }
+
+        .status-dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: #4caf50;
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(76,175,80,0.4); }
+            50% { opacity: 0.7; box-shadow: 0 0 0 8px rgba(76,175,80,0); }
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px; margin-bottom: 24px;
+        }
+
+        .card {
+            background: #1a1a2e; border: 1px solid #2a2a3e;
+            border-radius: 12px; padding: 20px;
+            transition: border-color 0.2s;
+        }
+        .card:hover { border-color: #3a3a5e; }
+
+        .card-label {
+            font-size: 12px; color: #888;
+            text-transform: uppercase; letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+
+        .card-value { font-size: 32px; font-weight: 700; color: #fff; }
+        .card-value.accent { color: #e94560; }
+        .card-value.green { color: #4caf50; }
+        .card-value.blue { color: #64b5f6; }
+        .card-value.orange { color: #ffb74d; }
+
+        .card-sub { font-size: 12px; color: #666; margin-top: 4px; }
+        .wide-card { grid-column: 1 / -1; }
+
+        .token-bar {
+            margin-top: 12px; background: #2a2a3e;
+            border-radius: 6px; height: 8px; overflow: hidden;
+        }
+        .token-bar-fill {
+            height: 100%; border-radius: 6px;
+            transition: width 0.5s ease;
+            background: linear-gradient(90deg, #4caf50, #ffb74d, #e94560);
+        }
+
+        .token-details {
+            display: flex; justify-content: space-between;
+            margin-top: 8px; font-size: 12px; color: #888;
+        }
+
+        .setup-card {
+            background: #1a1a2e; border: 1px solid #2a2a3e;
+            border-radius: 12px; padding: 24px; margin-top: 24px;
+        }
+        .setup-card h3 { color: #fff; margin-bottom: 16px; font-size: 16px; }
+
+        .setup-row {
+            display: flex; justify-content: space-between;
+            align-items: center; padding: 8px 0;
+            border-bottom: 1px solid #2a2a3e;
+        }
+        .setup-row:last-child { border-bottom: none; }
+        .setup-label { color: #888; font-size: 14px; }
+
+        .setup-value {
+            font-family: 'SF Mono', 'Fira Code', monospace;
+            font-size: 13px; color: #64b5f6;
+            background: #0f0f1a; padding: 4px 12px;
+            border-radius: 6px; cursor: pointer;
+            border: 1px solid transparent; transition: border-color 0.2s;
+        }
+        .setup-value:hover { border-color: #64b5f6; }
+        .setup-value.copied { border-color: #4caf50; color: #4caf50; }
+
+        .footer {
+            text-align: center; margin-top: 32px;
+            font-size: 12px; color: #444;
+        }
+        .footer a { color: #64b5f6; text-decoration: none; }
+        .footer a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔌 ApiFreeLLM Proxy</h1>
+            <div class="status-badge">
+                <div class="status-dot"></div>
+                Работает • <span id="uptime">—</span>
+            </div>
+        </header>
+
+        <div class="grid">
+            <div class="card">
+                <div class="card-label">Запросов обработано</div>
+                <div class="card-value green" id="total-requests">—</div>
+                <div class="card-sub">
+                    <span id="failed-requests">0</span> ошибок •
+                    <span id="filtered-requests">0</span> отфильтровано
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-label">Среднее время ответа</div>
+                <div class="card-value blue" id="avg-time">—</div>
+                <div class="card-sub">Rate limit: __RATE_LIMIT__с между запросами</div>
+            </div>
+
+            <div class="card wide-card">
+                <div class="card-label">Токены использовано (приблизительно)</div>
+                <div class="card-value accent" id="total-tokens">—</div>
+                <div class="token-bar">
+                    <div class="token-bar-fill" id="token-bar" style="width: 0%"></div>
+                </div>
+                <div class="token-details">
+                    <span>📤 Промпт: <strong id="prompt-tokens">0</strong></span>
+                    <span>📥 Ответ: <strong id="completion-tokens">0</strong></span>
+                    <span>📊 Контекст обрезан: <strong id="truncations">0</strong> раз</span>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-label">Лимит контекста</div>
+                <div class="card-value orange">__CONTEXT_LIMIT__</div>
+                <div class="card-sub">Резерв на ответ: __RESPONSE_RESERVE__</div>
+            </div>
+
+            <div class="card">
+                <div class="card-label">Модель</div>
+                <div class="card-value" style="font-size: 20px; color: #ce93d8;"
+                    id="model-name">__MODEL__</div>
+                <div class="card-sub">ApiFreeLLM Free Tier</div>
+            </div>
+        </div>
+
+        <div class="setup-card">
+            <h3>⚙️ Настройки для клиента</h3>
+            <div class="setup-row">
+                <span class="setup-label">API URL</span>
+                <span class="setup-value" onclick="copyText(this)"
+                    >http://localhost:__PORT__/v1</span>
+            </div>
+            <div class="setup-row">
+                <span class="setup-label">Полный эндпоинт</span>
+                <span class="setup-value" onclick="copyText(this)"
+                    >http://localhost:__PORT__/v1/chat/completions</span>
+            </div>
+            <div class="setup-row">
+                <span class="setup-label">API Key</span>
+                <span class="setup-value" onclick="copyText(this)">любой-текст</span>
+            </div>
+            <div class="setup-row">
+                <span class="setup-label">Model</span>
+                <span class="setup-value" onclick="copyText(this)">__MODEL__</span>
+            </div>
+        </div>
+
+        <div class="footer">
+            <a href="/docs">📖 API Docs</a> •
+            <a href="/v1/stats">📊 Stats JSON</a> •
+            <a href="https://apifreellm.com" target="_blank">ApiFreeLLM</a>
+        </div>
+    </div>
+
+    <script>
+        function copyText(el) {
+            const text = el.textContent;
+            navigator.clipboard.writeText(text).then(() => {
+                el.classList.add('copied');
+                const orig = el.textContent;
+                el.textContent = '✓ Скопировано';
+                setTimeout(() => { el.textContent = orig; el.classList.remove('copied'); }, 1500);
+            });
+        }
+
+        function fmt(n) {
+            return n.toString().replace(/\\B(?=(\\d{3})+(?!\\d))/g, ' ');
+        }
+
+        async function updateStats() {
+            try {
+                const r = await fetch('/v1/stats');
+                const d = await r.json();
+                document.getElementById('uptime').textContent = d.uptime_human;
+                document.getElementById('total-requests').textContent = fmt(d.successful);
+                document.getElementById('failed-requests').textContent = d.failed;
+                document.getElementById('filtered-requests').textContent = d.title_filtered;
+                document.getElementById('avg-time').textContent = d.avg_response_time_seconds + 'с';
+                document.getElementById('total-tokens').textContent = d.tokens.total_human;
+                document.getElementById('prompt-tokens').textContent = fmt(d.tokens.prompt);
+                document.getElementById('completion-tokens').textContent = fmt(d.tokens.completion);
+                document.getElementById('truncations').textContent = d.context_truncations;
+                const pct = Math.min((d.tokens.total / 1000000) * 100, 100);
+                document.getElementById('token-bar').style.width = pct + '%';
+            } catch(e) {}
+        }
+
+        updateStats();
+        setInterval(updateStats, 3000);
+    </script>
+</body>
+</html>"""
 
 
 # ====== ЭНДПОИНТЫ ======
 
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    html = DASHBOARD_HTML
+    html = html.replace("__PORT__", str(SERVER_PORT))
+    html = html.replace("__MODEL__", DEFAULT_MODEL)
+    html = html.replace("__RATE_LIMIT__", str(RATE_LIMIT_INTERVAL))
+    html = html.replace("__CONTEXT_LIMIT__", f"{CONTEXT_LIMIT_TOKENS // 1000}k")
+    html = html.replace("__RESPONSE_RESERVE__", f"{RESPONSE_RESERVE_TOKENS // 1000}k")
+    return HTMLResponse(content=html)
+
+
+@app.get("/v1/stats")
+async def get_stats():
+    return proxy_stats.to_dict()
+
+
 @app.post("/v1/chat/completions")
 async def proxy_chat(request: Request):
-    """Принимает OpenAI-запрос, проксирует в ApiFreeLLM."""
     req_id = next(_request_id_generator)
 
     try:
@@ -594,62 +933,26 @@ async def proxy_chat(request: Request):
     model = data.get("model", DEFAULT_MODEL)
     use_stream = data.get("stream", False)
 
-    # Детальный лог входящего запроса
-    logger.info(
-        "[#%d] Получен запрос: model=%s, stream=%s, сообщений=%d",
-        req_id, model, use_stream, len(messages),
+    # Компактный лог: одна строка вместо N строк на каждое сообщение
+    total_content_len = sum(
+        len(extract_text_content(m.get("content", ""))) for m in messages
     )
-    for i, msg in enumerate(messages):
-        role = msg.get("role", "?")
-        content = extract_text_content(msg.get("content", ""))
-        preview = content[:150] + "..." if len(content) > 150 else content
-        logger.info(
-            "[#%d]   msg[%d] role=%s len=%d: %s",
-            req_id, i, role, len(content), preview,
-        )
+    logger.info(
+        "[#%d] Запрос: %d сообщений, ~%d символов, stream=%s",
+        req_id, len(messages), total_content_len, use_stream,
+    )
 
-    # --- Генерация названия чата (мгновенно, без API) ---
+    # --- Генерация названия чата ---
     if is_title_generation_request(messages):
         title = generate_smart_title(messages)
-        logger.info("[#%d] Название чата -> '%s'", req_id, title)
+        logger.info("[#%d] → Название чата: '%s'", req_id, title)
+        proxy_stats.record_title_filtered()
 
         if use_stream:
             return StreamingResponse(
                 stream_response(title, model),
                 media_type="text/event-stream",
             )
-        else:
-            return JSONResponse(content={
-                "id": generate_completion_id(),
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": title},
-                    "finish_reason": "stop",
-                }],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            })
-
-    # --- Настоящий запрос пользователя ---
-    prompt = build_prompt_from_messages(messages)
-
-    if not prompt.strip():
-        raise HTTPException(status_code=400, detail="Все сообщения пустые.")
-
-    logger.info("[#%d] Запрос пользователя: %d сообщений", req_id, len(messages))
-
-    result = await send_to_upstream(prompt, model)
-
-    logger.info("[#%d] Ответ отправлен клиенту.", req_id)
-
-    if use_stream:
-        return StreamingResponse(
-            stream_response(result["text"], model),
-            media_type="text/event-stream",
-        )
-    else:
         return JSONResponse(content={
             "id": generate_completion_id(),
             "object": "chat.completion",
@@ -657,14 +960,66 @@ async def proxy_chat(request: Request):
             "model": model,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": result["text"]},
+                "message": {"role": "assistant", "content": title},
                 "finish_reason": "stop",
             }],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
 
+    # --- Сжатие контекста ---
+    trimmed_messages = trim_messages_to_fit(messages, MAX_PROMPT_TOKENS)
 
-# Запасной маршрут — некоторые клиенты шлют прямо на /v1
+    # --- Формируем промпт ---
+    prompt = build_prompt_from_messages(trimmed_messages)
+
+    if not prompt.strip():
+        raise HTTPException(status_code=400, detail="Все сообщения пустые.")
+
+    prompt_tokens = estimate_tokens(prompt)
+    logger.info("[#%d] → Промпт: ~%d токенов", req_id, prompt_tokens)
+
+    # --- Отправляем в API ---
+    start_time = time.monotonic()
+
+    try:
+        result = await send_to_upstream(prompt, model)
+    except HTTPException:
+        proxy_stats.record_failure()
+        raise
+
+    elapsed = time.monotonic() - start_time
+    completion_tokens = estimate_tokens(result["text"])
+    proxy_stats.record_success(elapsed, prompt_tokens, completion_tokens)
+
+    logger.info(
+        "[#%d] ✓ Ответ: ~%d токенов за %.1fс (сессия: ~%s)",
+        req_id, completion_tokens, elapsed,
+        _format_tokens(proxy_stats.total_tokens),
+    )
+
+    if use_stream:
+        return StreamingResponse(
+            stream_response(result["text"], model),
+            media_type="text/event-stream",
+        )
+    return JSONResponse(content={
+        "id": generate_completion_id(),
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": result["text"]},
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        },
+    })
+
+
 @app.post("/v1")
 async def proxy_chat_alt(request: Request):
     return await proxy_chat(request)
