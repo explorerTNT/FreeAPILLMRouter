@@ -9,21 +9,29 @@ import sys
 import traceback
 from pathlib import Path
 
-# Определяем, запущен ли скрипт в CI-среде (GitHub Actions).
+# [ДОБАВЛЕНО] Принудительно устанавливаем UTF-8 для stdout/stderr.
+# GitHub Actions на Windows использует кодировку CP1252,
+# которая не поддерживает кириллицу — print("Привет") вызовет
+# UnicodeEncodeError. Эта настройка решает проблему.
+os.environ["PYTHONIOENCODING"] = "utf-8"
+
+# [ДОБАВЛЕНО] Определяем, запущен ли скрипт в CI (GitHub Actions).
 # В CI нет окна которое закроется — лог видно прямо в браузере,
-# поэтому перенаправлять stdout в файл не нужно и даже вредно:
-# GitHub Actions читает именно stdout чтобы показать лог во вкладке.
+# поэтому перенаправлять stdout в файл не нужно.
 IS_CI = os.environ.get("CI", "false").lower() == "true"
 
 if not IS_CI:
-    # Локальная сборка — перенаправляем в файл как раньше,
-    # чтобы видеть лог даже если окно консоли закрылось
+    # Локальная сборка — перенаправляем в файл как раньше
     log_file = Path(__file__).parent / "build_log.txt"
     sys.stdout = open(log_file, "w", encoding="utf-8")
     sys.stderr = sys.stdout
 else:
-    # CI — пишем в обычный stdout, GitHub Actions сам сохраняет лог
+    # CI — оборачиваем stdout в UTF-8, чтобы кириллица не падала.
+    # reconfigure() меняет кодировку уже открытого потока —
+    # это безопаснее чем создавать новый объект.
     log_file = None
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
 
 print("=== НАЧАЛО СБОРКИ ===")
 print(f"Python: {sys.version}")
@@ -35,12 +43,14 @@ try:
     print("PIL: OK")
 except Exception as e:
     print(f"PIL ОШИБКА: {e}")
+    sys.exit(1)
 
 try:
     import PyInstaller.__main__
     print("PyInstaller: OK")
 except Exception as e:
     print(f"PyInstaller ОШИБКА: {e}")
+    sys.exit(1)
 
 project_dir = Path(__file__).parent.resolve()
 os.chdir(project_dir)
@@ -165,6 +175,7 @@ finally:
     if icon_ico.exists():
         icon_ico.unlink()
 
+    # Закрываем лог только если мы его открывали (не CI)
     if not IS_CI and log_file is not None:
         sys.stdout.close()
 

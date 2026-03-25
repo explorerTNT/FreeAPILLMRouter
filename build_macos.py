@@ -9,7 +9,13 @@ import sys
 import traceback
 from pathlib import Path
 
+os.environ["PYTHONIOENCODING"] = "utf-8"
+
 IS_CI = os.environ.get("CI", "false").lower() == "true"
+
+if IS_CI:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
 
 print("=== НАЧАЛО СБОРКИ macOS ===")
 print(f"Python: {sys.version}")
