@@ -11,11 +11,13 @@
 """
 
 import asyncio
+import itertools
 import json
 import re
 import time
 import uuid
 import logging
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException
@@ -30,15 +32,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="ApiFreeLLM Proxy",
-    description="OpenAI-совместимый прокси для ApiFreeLLM",
-    version="1.0.0",
-)
 
 # ====== НАСТРОЙКИ (заполняются при старте сервера) ======
 # Не загружаем конфиг при импорте — это ломает PyInstaller сборку.
-# Конфиг загружается в on_startup когда приложение реально запускается.
+# Конфиг загружается в lifespan когда приложение реально запускается.
 API_KEY: str = ""
 API_ENDPOINT: str = ""
 DEFAULT_MODEL: str = "apifreellm"
@@ -51,9 +48,77 @@ request_lock = asyncio.Lock()
 last_request_time: float = 0.0
 RATE_LIMIT_INTERVAL = 25
 MAX_RETRIES = 3
-# =================================
 
-request_counter: int = 0
+# Переиспользуемый HTTP-клиент — создаётся один раз при старте.
+# Экономит ~200-500мс на каждом запросе (не нужно заново устанавливать
+# TCP-соединение и проходить TLS-рукопожатие).
+http_client: httpx.AsyncClient | None = None
+
+# Потокобезопасный счётчик запросов.
+# itertools.count — атомарный, не сломается если uvicorn запустит
+# несколько воркеров или задачи переключатся между await.
+_request_id_generator = itertools.count(1)
+
+
+# ====== ЖИЗНЕННЫЙ ЦИКЛ ПРИЛОЖЕНИЯ ======
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    """
+    Управление жизненным циклом приложения.
+    Код до yield выполняется при запуске сервера.
+    Код после yield выполняется при остановке.
+    """
+    global API_KEY, API_ENDPOINT, DEFAULT_MODEL
+    global UPSTREAM_TIMEOUT, SERVER_HOST, SERVER_PORT
+    global http_client
+
+    from config import load_config
+    config = load_config()
+
+    # Заполняем глобальные переменные из конфига
+    API_KEY = config["api_key"]
+    API_ENDPOINT = config["api_endpoint"]
+    DEFAULT_MODEL = config["model"]
+    UPSTREAM_TIMEOUT = config["upstream_timeout_seconds"]
+    SERVER_HOST = config["server"]["host"]
+    SERVER_PORT = config["server"]["port"]
+
+    # Создаём HTTP-клиент один раз на всё время жизни сервера.
+    http_client = httpx.AsyncClient(
+        timeout=UPSTREAM_TIMEOUT,
+        limits=httpx.Limits(
+            max_keepalive_connections=5,
+            max_connections=10,
+        ),
+    )
+
+    logger.info("=" * 50)
+    logger.info("Сервер запущен!")
+    logger.info("Прокси: http://%s:%d", SERVER_HOST, SERVER_PORT)
+    logger.info("Upstream: %s", API_ENDPOINT)
+    logger.info("Rate limit: 1 запрос / %d сек", RATE_LIMIT_INTERVAL)
+    logger.info("Фильтрация мусорных запросов: ВКЛ")
+    logger.info("Поддержка стриминга (SSE): ВКЛ")
+    logger.info("Совместимость с CCR: ВКЛ")
+    logger.info("Документация: http://localhost:%d/docs", SERVER_PORT)
+    logger.info("=" * 50)
+
+    yield  # ← Сервер работает, обрабатывает запросы
+
+    # Код ниже выполняется при остановке сервера
+    if http_client:
+        await http_client.aclose()
+        logger.info("HTTP-клиент закрыт.")
+    logger.info("Сервер остановлен.")
+
+
+app = FastAPI(
+    title="ApiFreeLLM Proxy",
+    description="OpenAI-совместимый прокси для ApiFreeLLM",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 # ====== ИЗВЛЕЧЕНИЕ ТЕКСТА ИЗ CONTENT ======
@@ -93,11 +158,29 @@ def is_title_generation_request(messages: list[dict]) -> bool:
     """
     Определяет, является ли запрос попыткой клиента сгенерировать
     название для чата.
+
+    [ИСПРАВЛЕНО] Добавлена проверка длины сообщения.
+    Настоящие запросы на генерацию названия — это короткие инструкции
+    (обычно до 500 символов). Если сообщение длиннее — это обычный
+    запрос пользователя, внутри которого случайно встретился маркер
+    (например, пользователь отправил исходный код на ревью, и в коде
+    есть строки-маркеры вроде "give this conversation a name").
     """
     if not messages:
         return False
 
-    last_content = extract_text_content(messages[-1].get("content", "")).lower()
+    last_msg = messages[-1]
+    last_content = extract_text_content(last_msg.get("content", ""))
+
+    # --- Защита от ложных срабатываний ---
+    # Запрос на генерацию названия — это короткая инструкция от клиента.
+    # Если сообщение длиннее 1000 символов — это точно НЕ запрос на название,
+    # а обычное сообщение пользователя (возможно, с кодом внутри).
+    # 1000 символов — с большим запасом, реальные запросы обычно до 500.
+    if len(last_content) > 1000:
+        return False
+
+    last_content_lower = last_content.lower()
 
     title_markers = [
         # ChatboxAI
@@ -116,7 +199,7 @@ def is_title_generation_request(messages: list[dict]) -> bool:
     ]
 
     for marker in title_markers:
-        if marker in last_content:
+        if marker in last_content_lower:
             return True
 
     return False
@@ -231,52 +314,63 @@ def _trim_title(text: str) -> str:
 
 # ====== СТРИМИНГ (SSE) ======
 
-def create_stream_chunk(content: str, model: str, finish_reason: str = None) -> str:
-    """Формирует один чанк SSE-ответа в формате OpenAI."""
-    chunk = {
-        "id": generate_completion_id(),
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "delta": {},
-                "finish_reason": finish_reason,
-            }
-        ],
-    }
-
-    if finish_reason is None:
-        chunk["choices"][0]["delta"] = {"content": content}
-
-    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-
-
 async def stream_response(text: str, model: str):
-    """Генератор SSE-ответа — отдаёт текст по частям."""
+    """
+    Генератор SSE-ответа — отдаёт текст по частям.
+
+    Все чанки одного ответа имеют одинаковый id и created —
+    это требование спецификации OpenAI. Без этого некоторые
+    клиенты (ChatboxAI, CCR) могут некорректно группировать чанки.
+    """
+    # Один ID и timestamp на весь ответ
+    completion_id = generate_completion_id()
+    created = int(time.time())
+
+    # Первый чанк — сообщает клиенту роль ассистента
     first_chunk = {
-        "id": generate_completion_id(),
+        "id": completion_id,
         "object": "chat.completion.chunk",
-        "created": int(time.time()),
+        "created": created,
         "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "delta": {"role": "assistant", "content": ""},
-                "finish_reason": None,
-            }
-        ],
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": ""},
+            "finish_reason": None,
+        }],
     }
     yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
 
+    # Основные чанки с текстом
     chunk_size = 5
     for i in range(0, len(text), chunk_size):
         piece = text[i:i + chunk_size]
-        yield create_stream_chunk(piece, model)
+        content_chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"content": piece},
+                "finish_reason": None,
+            }],
+        }
+        yield f"data: {json.dumps(content_chunk, ensure_ascii=False)}\n\n"
         await asyncio.sleep(0.02)
 
-    yield create_stream_chunk("", model, finish_reason="stop")
+    # Финальный чанк — сигнал клиенту что ответ завершён
+    stop_chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop",
+        }],
+    }
+    yield f"data: {json.dumps(stop_chunk, ensure_ascii=False)}\n\n"
     yield "data: [DONE]\n\n"
 
 
@@ -309,19 +403,31 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
                 MAX_RETRIES,
             )
 
+            # Логируем начало и конец промпта.
+            prompt_len = len(prompt)
+            if prompt_len > 400:
+                prompt_preview = (
+                    f"{prompt[:200]}\n"
+                    f"... [{prompt_len} символов всего] ...\n"
+                    f"{prompt[-200:]}"
+                )
+            else:
+                prompt_preview = prompt
+            logger.info("Промпт (%d символов):\n%s", prompt_len, prompt_preview)
+
             try:
-                async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-                    response = await client.post(
-                        API_ENDPOINT,
-                        headers={
-                            "Authorization": f"Bearer {API_KEY}",
-                            "Content-Type": "application/json",
-                        },
-                        json={
-                            "message": prompt,
-                            "model": model,
-                        },
-                    )
+                # Используем глобальный http_client
+                response = await http_client.post(
+                    API_ENDPOINT,
+                    headers={
+                        "Authorization": f"Bearer {API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "message": prompt,
+                        "model": model,
+                    },
+                )
             except httpx.TimeoutException:
                 logger.error("Таймаут (%ds)", UPSTREAM_TIMEOUT)
                 raise HTTPException(
@@ -364,10 +470,8 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
                 )
                 raise HTTPException(
                     status_code=response.status_code,
-                    detail={
-                        "error": "Ошибка от ApiFreeLLM",
-                        "upstream_body": response.text,
-                    },
+                    detail=f"Ошибка от ApiFreeLLM ({response.status_code}): "
+                           f"{response.text[:300]}",
                 )
 
             try:
@@ -387,77 +491,96 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
                 )
 
             output_text = result_json.get("response", "")
-            logger.info("Ответ получен: %d символов", len(output_text))
+
+            # Логируем тело ответа
+            if len(output_text) > 1000:
+                logger.info(
+                    "Ответ (%d символов):\n%s\n... [обрезано для лога] ...\n%s",
+                    len(output_text),
+                    output_text[:500],
+                    output_text[-200:],
+                )
+            else:
+                logger.info(
+                    "Ответ (%d символов):\n%s",
+                    len(output_text),
+                    output_text,
+                )
+
             return {"text": output_text}
 
     raise HTTPException(status_code=500, detail="Неожиданная ошибка.")
 
 
-# ====== ЭНДПОИНТЫ ======
-
-@app.on_event("startup")
-async def on_startup():
-    """
-    Загружаем конфиг здесь, а не при импорте модуля.
-    Это критично для PyInstaller — при сборке модуль импортируется
-    без реального запуска сервера, и config.json может не существовать.
-    """
-    global API_KEY, API_ENDPOINT, DEFAULT_MODEL, UPSTREAM_TIMEOUT, SERVER_HOST, SERVER_PORT
-
-    from config import load_config
-    config = load_config()
-
-    # Заполняем глобальные переменные из конфига
-    API_KEY = config["api_key"]
-    API_ENDPOINT = config["api_endpoint"]
-    DEFAULT_MODEL = config["model"]
-    UPSTREAM_TIMEOUT = config["upstream_timeout_seconds"]
-    SERVER_HOST = config["server"]["host"]
-    SERVER_PORT = config["server"]["port"]
-
-    logger.info("=" * 50)
-    logger.info("Сервер запущен!")
-    logger.info("Прокси: http://%s:%d", SERVER_HOST, SERVER_PORT)
-    logger.info("Upstream: %s", API_ENDPOINT)
-    logger.info("Rate limit: 1 запрос / %d сек", RATE_LIMIT_INTERVAL)
-    logger.info("Фильтрация мусорных запросов: ВКЛ")
-    logger.info("Поддержка стриминга (SSE): ВКЛ")
-    logger.info("Совместимость с CCR: ВКЛ")
-    logger.info("Документация: http://localhost:%d/docs", SERVER_PORT)
-    logger.info("=" * 50)
-
+# ====== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======
 
 def build_prompt_from_messages(messages: list[dict]) -> str:
-    """Склеивает массив сообщений OpenAI-формата в один промпт."""
+    """
+    Склеивает массив сообщений OpenAI-формата в один промпт.
+
+    ApiFreeLLM принимает одну строку в поле "message",
+    поэтому нам нужно объединить всю историю диалога.
+    """
     if not messages:
         return ""
 
+    system_parts = []
+    dialogue_parts = []
+
     role_labels = {
-        "system": "System",
         "user": "User",
         "assistant": "Assistant",
     }
 
-    parts = []
     for msg in messages:
         role = msg.get("role", "user")
         content = extract_text_content(msg.get("content", ""))
-        label = role_labels.get(role, role.capitalize())
-        parts.append(f"{label}: {content}")
+
+        if not content.strip():
+            # Пропускаем пустые сообщения — они только засоряют промпт
+            continue
+
+        if role == "system":
+            # Системные сообщения собираем отдельно —
+            # они должны быть в начале как инструкция для модели
+            system_parts.append(content)
+        else:
+            label = role_labels.get(role, role.capitalize())
+            dialogue_parts.append(f"{label}: {content}")
+
+    # Если одно сообщение от user и нет system —
+    # отправляем без обёрток. Модель лучше понимает
+    # чистый текст чем "User: текст".
+    if not system_parts and len(dialogue_parts) == 1:
+        single_msg = dialogue_parts[0]
+        if single_msg.startswith("User: "):
+            return single_msg[6:]  # len("User: ") == 6
+        return single_msg
+
+    # Собираем финальный промпт
+    parts = []
+
+    if system_parts:
+        # Явно помечаем как системную инструкцию
+        parts.append("[System instruction]\n" + "\n".join(system_parts))
+
+    if dialogue_parts:
+        parts.append("\n\n".join(dialogue_parts))
 
     return "\n\n".join(parts)
 
 
 def generate_completion_id() -> str:
+    """Генерирует уникальный ID ответа в формате OpenAI."""
     return f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
+
+# ====== ЭНДПОИНТЫ ======
 
 @app.post("/v1/chat/completions")
 async def proxy_chat(request: Request):
     """Принимает OpenAI-запрос, проксирует в ApiFreeLLM."""
-    global request_counter
-    request_counter += 1
-    req_id = request_counter
+    req_id = next(_request_id_generator)
 
     try:
         data = await request.json()
@@ -470,6 +593,20 @@ async def proxy_chat(request: Request):
 
     model = data.get("model", DEFAULT_MODEL)
     use_stream = data.get("stream", False)
+
+    # Детальный лог входящего запроса
+    logger.info(
+        "[#%d] Получен запрос: model=%s, stream=%s, сообщений=%d",
+        req_id, model, use_stream, len(messages),
+    )
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "?")
+        content = extract_text_content(msg.get("content", ""))
+        preview = content[:150] + "..." if len(content) > 150 else content
+        logger.info(
+            "[#%d]   msg[%d] role=%s len=%d: %s",
+            req_id, i, role, len(content), preview,
+        )
 
     # --- Генерация названия чата (мгновенно, без API) ---
     if is_title_generation_request(messages):

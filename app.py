@@ -73,6 +73,7 @@ def handle_exception(exc_type, exc_value, exc_traceback):
         exc_info=(exc_type, exc_value, exc_traceback),
     )
 
+
 sys.excepthook = handle_exception
 
 logger.info("=" * 50)
@@ -193,42 +194,52 @@ def show_config_file(config_path: Path):
 
 
 def ensure_config_exists():
-    """Проверяет конфигурацию с GUI-уведомлениями."""
+    """
+    Проверяет конфигурацию с GUI-уведомлениями.
+
+    [ИЗМЕНЕНО] Теперь ловит ConfigError из load_config()
+    вместо того чтобы дублировать логику проверок.
+    load_config() бросает исключение — мы его ловим,
+    определяем тип ошибки и показываем нужное GUI-окно.
+    """
     base_dir = get_base_dir()
     os.chdir(base_dir)
     logger.info("Рабочая директория: %s", base_dir)
 
-    from config import CONFIG_PATH, DEFAULT_CONFIG
+    from config import CONFIG_PATH, ConfigError
 
     logger.info("Путь к конфигу: %s", CONFIG_PATH)
 
-    if not CONFIG_PATH.exists():
-        logger.info("Первый запуск — создаю config.json")
-        from config import create_default_config
-        create_default_config()
-        show_first_run_message(CONFIG_PATH)
-        show_config_file(CONFIG_PATH)
-        return None
-
-    import json
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            config = json.load(f)
-    except json.JSONDecodeError as e:
-        logger.error("config.json повреждён: %s", e)
-        show_bad_json_message(CONFIG_PATH)
-        return None
+        from config import load_config
+        config = load_config()
+    except ConfigError as e:
+        error_msg = str(e)
+        logger.info("Ошибка конфигурации: %s", error_msg)
 
-    api_key = config.get("api_key", "")
-    if not api_key or api_key == DEFAULT_CONFIG["api_key"]:
-        logger.error("API-ключ не настроен")
-        show_no_key_message(CONFIG_PATH)
-        show_config_file(CONFIG_PATH)
+        # Определяем тип ошибки по тексту и показываем нужное окно
+        if "Создан config.json" in error_msg:
+            # Первый запуск — файл только что создан
+            logger.info("Первый запуск — создаю config.json")
+            show_first_run_message(CONFIG_PATH)
+            show_config_file(CONFIG_PATH)
+        elif "невалидный JSON" in error_msg:
+            # Файл повреждён
+            logger.error("config.json повреждён")
+            show_bad_json_message(CONFIG_PATH)
+        elif "не настроен" in error_msg:
+            # Ключ не заполнен
+            logger.error("API-ключ не настроен")
+            show_no_key_message(CONFIG_PATH)
+            show_config_file(CONFIG_PATH)
+        else:
+            # Неизвестная ошибка конфигурации
+            show_message(
+                "ApiFreeLLM Proxy — Ошибка",
+                f"Ошибка конфигурации:\\n{error_msg}",
+                is_error=True,
+            )
         return None
-
-    for key, default_value in DEFAULT_CONFIG.items():
-        if key not in config:
-            config[key] = default_value
 
     logger.info("Конфиг загружен, ключ настроен.")
     return config
