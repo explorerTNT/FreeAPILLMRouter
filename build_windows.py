@@ -9,14 +9,26 @@ import sys
 import traceback
 from pathlib import Path
 
-# Перенаправляем все ошибки в файл — чтобы видеть их даже если окно закрывается
-log_file = Path(__file__).parent / "build_log.txt"
-sys.stdout = open(log_file, "w", encoding="utf-8")
-sys.stderr = sys.stdout
+# Определяем, запущен ли скрипт в CI-среде (GitHub Actions).
+# В CI нет окна которое закроется — лог видно прямо в браузере,
+# поэтому перенаправлять stdout в файл не нужно и даже вредно:
+# GitHub Actions читает именно stdout чтобы показать лог во вкладке.
+IS_CI = os.environ.get("CI", "false").lower() == "true"
+
+if not IS_CI:
+    # Локальная сборка — перенаправляем в файл как раньше,
+    # чтобы видеть лог даже если окно консоли закрылось
+    log_file = Path(__file__).parent / "build_log.txt"
+    sys.stdout = open(log_file, "w", encoding="utf-8")
+    sys.stderr = sys.stdout
+else:
+    # CI — пишем в обычный stdout, GitHub Actions сам сохраняет лог
+    log_file = None
 
 print("=== НАЧАЛО СБОРКИ ===")
 print(f"Python: {sys.version}")
 print(f"Папка: {Path(__file__).parent}")
+print(f"CI: {IS_CI}")
 
 try:
     from PIL import Image
@@ -146,16 +158,17 @@ except Exception as e:
     print(f"{e}")
     print("\nПолный traceback:")
     traceback.print_exc()
+    sys.exit(1)
 
 finally:
     # Убираем временный .ico
     if icon_ico.exists():
         icon_ico.unlink()
 
-    # Закрываем лог файл
-    sys.stdout.close()
+    if not IS_CI and log_file is not None:
+        sys.stdout.close()
 
-    # Выводим сообщение в реальную консоль
-    sys.__stdout__.write(f"\nЛог сборки сохранён в: {log_file}\n")
-    sys.__stdout__.write("Открой этот файл чтобы увидеть результат.\n")
-    sys.__stdout__.flush()
+        # Выводим сообщение в реальную консоль
+        sys.__stdout__.write(f"\nЛог сборки сохранён в: {log_file}\n")
+        sys.__stdout__.write("Открой этот файл чтобы увидеть результат.\n")
+        sys.__stdout__.flush()

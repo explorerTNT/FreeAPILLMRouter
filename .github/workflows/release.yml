@@ -1,0 +1,152 @@
+# ============================================================
+# GitHub Actions: автоматическая сборка и публикация релизов
+#
+# Триггер: создание тега вида v1.0.0, v2.3.1 и т.д.
+# Результат: GitHub Release с .exe (Windows) и .app (macOS)
+# ============================================================
+
+name: Build and Release
+
+# Запускается только при пуше тега формата "v*" (v1.0.0, v0.2.3 и т.д.)
+on:
+  push:
+    tags:
+      - "v*"
+
+# Разрешения для создания релизов — без этого Actions не сможет
+# загружать файлы в Release
+permissions:
+  contents: write
+
+jobs:
+  # ==================== СБОРКА WINDOWS ====================
+  build-windows:
+    name: "🪟 Сборка Windows (.exe)"
+    runs-on: windows-latest
+
+    steps:
+      # 1. Клонируем репозиторий
+      - name: Клонирование репозитория
+        uses: actions/checkout@v4
+
+      # 2. Устанавливаем Python
+      - name: Установка Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 3. Кэшируем pip-зависимости — при повторных сборках не будет
+      #    заново скачивать все пакеты, экономит 1-2 минуты
+      - name: Кэширование pip
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: windows-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            windows-pip-
+
+      # 4. Устанавливаем зависимости
+      - name: Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 5. Запускаем сборку через ваш скрипт
+      - name: Сборка .exe
+        run: python build_windows.py
+
+      # 6. Упаковываем папку dist/ApiFreeLLM-Proxy/ в ZIP-архив.
+      #    PyInstaller --onedir создаёт папку с .exe и DLL внутри,
+      #    поэтому нужно отдать всю папку целиком
+      - name: Упаковка в ZIP
+        run: |
+          cd dist
+          Compress-Archive -Path "ApiFreeLLM-Proxy" -DestinationPath "../ApiFreeLLM-Proxy-Windows.zip"
+
+      # 7. Загружаем артефакт — он будет доступен для job релиза
+      - name: Загрузка артефакта
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: ApiFreeLLM-Proxy-Windows.zip
+          # Артефакт хранится 1 день — он нужен только для создания релиза,
+          # после этого его можно удалить
+          retention-days: 1
+
+  # ==================== СБОРКА macOS ====================
+  build-macos:
+    name: "🍎 Сборка macOS (.app)"
+    runs-on: macos-latest
+
+    steps:
+      - name: Клонирование репозитория
+        uses: actions/checkout@v4
+
+      - name: Установка Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Кэширование pip
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: macos-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            macos-pip-
+
+      - name: Установка зависимостей
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Сборка .app
+        run: python build_macos.py
+
+      # Упаковываем .app в ZIP. Важно использовать ditto, а не zip —
+      # ditto правильно сохраняет метаданные macOS (права, симлинки),
+      # без этого .app может не запуститься у пользователя
+      - name: Упаковка в ZIP
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent "ApiFreeLLM-Proxy.app" "../ApiFreeLLM-Proxy-macOS.zip"
+
+      - name: Загрузка артефакта
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-build
+          path: ApiFreeLLM-Proxy-macOS.zip
+          retention-days: 1
+
+  # ==================== СОЗДАНИЕ РЕЛИЗА ====================
+  release:
+    name: "📦 Публикация релиза"
+    runs-on: ubuntu-latest
+    # Ждём завершения обеих сборок — релиз создаётся только
+    # если ОБЕ платформы собрались успешно
+    needs: [build-windows, build-macos]
+
+    steps:
+      # Скачиваем оба артефакта (Windows + macOS)
+      - name: Скачивание артефактов
+        uses: actions/download-artifact@v4
+        with:
+          # Без указания name — скачиваются ВСЕ артефакты
+          path: artifacts
+
+      # Создаём GitHub Release и прикрепляем файлы
+      - name: Создание релиза
+        uses: softprops/action-gh-release@v2
+        with:
+          # Заголовок релиза — берём имя тега (v1.0.0 и т.д.)
+          name: "ApiFreeLLM Proxy ${{ github.ref_name }}"
+          # Автогенерация описания из коммитов между тегами
+          generate_release_notes: true
+          # Помечаем как черновик — вы сможете отредактировать
+          # описание перед публикацией. Поставьте false если
+          # хотите публиковать сразу автоматически
+          draft: false
+          # Прикрепляемые файлы
+          files: |
+            artifacts/windows-build/ApiFreeLLM-Proxy-Windows.zip
+            artifacts/macos-build/ApiFreeLLM-Proxy-macOS.zip
