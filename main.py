@@ -167,10 +167,10 @@ def _format_duration(seconds: float) -> str:
     minutes = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
     if hours > 0:
-        return f"{hours}ч {minutes}м {secs}с"
+        return f"{hours}h {minutes}m {secs}s"
     if minutes > 0:
-        return f"{minutes}м {secs}с"
-    return f"{secs}с"
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
 
 
 def _format_tokens(tokens: int) -> str:
@@ -209,15 +209,15 @@ async def lifespan(application: FastAPI):
     )
 
     logger.info("=" * 50)
-    logger.info("Сервер запущен!")
-    logger.info("Прокси: http://%s:%d", SERVER_HOST, SERVER_PORT)
+    logger.info("Server started!")
+    logger.info("Proxy: http://%s:%d", SERVER_HOST, SERVER_PORT)
     logger.info("Upstream: %s", API_ENDPOINT)
-    logger.info("Rate limit: %dс | Контекст: %dk (резерв %dk)",
+    logger.info("Rate limit: %ds | Context: %dk (reserve %dk)",
                 RATE_LIMIT_INTERVAL,
                 CONTEXT_LIMIT_TOKENS // 1000,
                 RESPONSE_RESERVE_TOKENS // 1000)
-    logger.info("Дашборд: http://localhost:%d/", SERVER_PORT)
-    logger.info("Документация: http://localhost:%d/docs", SERVER_PORT)
+    logger.info("Dashboard: http://localhost:%d/", SERVER_PORT)
+    logger.info("API Docs: http://localhost:%d/docs", SERVER_PORT)
     logger.info("=" * 50)
 
     yield
@@ -225,14 +225,14 @@ async def lifespan(application: FastAPI):
     if http_client:
         await http_client.aclose()
 
-    logger.info("Сессия завершена: %d запросов, ~%s токенов",
+    logger.info("Session ended: %d requests, ~%s tokens",
                 proxy_stats.total_requests,
                 _format_tokens(proxy_stats.total_tokens))
 
 
 app = FastAPI(
     title="ApiFreeLLM Proxy",
-    description="OpenAI-совместимый прокси для ApiFreeLLM",
+    description="OpenAI-compatible proxy for ApiFreeLLM",
     version="2.0.0",
     lifespan=lifespan,
 )
@@ -306,7 +306,7 @@ def generate_smart_title(messages: list[dict]) -> str:
         if role == "assistant" and content:
             return _trim_title(content)
 
-    return "Новый чат"
+    return "New chat"
 
 
 def _extract_from_code_block(text: str) -> str:
@@ -353,7 +353,7 @@ def _trim_title(text: str) -> str:
     title = " ".join(words[:6]) + ("..." if len(words) > 6 else "")
 
     if len(title) < 2:
-        return "Новый чат"
+        return "New chat"
     if len(title) > 50:
         title = title[:47] + "..."
     return title
@@ -362,10 +362,6 @@ def _trim_title(text: str) -> str:
 # ====== УМНОЕ СЖАТИЕ КОНТЕКСТА ======
 
 def trim_messages_to_fit(messages: list[dict], max_tokens: int) -> list[dict]:
-    """
-    Обрезает историю сообщений чтобы уложиться в лимит токенов.
-    Приоритет: system prompt > последний вопрос > свежие сообщения > старые.
-    """
     if not messages:
         return messages
 
@@ -379,11 +375,9 @@ def trim_messages_to_fit(messages: list[dict], max_tokens: int) -> list[dict]:
     if total_tokens <= max_tokens:
         return messages
 
-    # Контекст не влезает — обрезаем
     proxy_stats.record_truncation()
-    logger.info("Контекст: ~%d > %d токенов — обрезаю", total_tokens, max_tokens)
+    logger.info("Context: ~%d > %d tokens, trimming...", total_tokens, max_tokens)
 
-    # Системные сообщения — всегда оставляем
     system_msgs = []
     system_tokens = 0
     for i, msg in enumerate(messages):
@@ -391,7 +385,6 @@ def trim_messages_to_fit(messages: list[dict], max_tokens: int) -> list[dict]:
             system_msgs.append(msg)
             system_tokens += msg_tokens[i]
 
-    # Последний вопрос пользователя — всегда оставляем
     last_user_msg = None
     last_user_tokens = 0
     for i in range(len(messages) - 1, -1, -1):
@@ -403,13 +396,12 @@ def trim_messages_to_fit(messages: list[dict], max_tokens: int) -> list[dict]:
     reserved_tokens = system_tokens + last_user_tokens + 50
 
     if reserved_tokens >= max_tokens:
-        logger.warning("System + вопрос не влезают (%d > %d), отправляю только вопрос",
+        logger.warning("System + question exceed limit (%d > %d), sending question only",
                         reserved_tokens, max_tokens)
         if last_user_msg:
             return [last_user_msg]
         return [messages[-1]]
 
-    # Собираем диалог (без system), берём с конца сколько влезет
     remaining_budget = max_tokens - reserved_tokens
 
     dialogue_msgs = []
@@ -438,8 +430,8 @@ def trim_messages_to_fit(messages: list[dict], max_tokens: int) -> list[dict]:
         result.append({
             "role": "system",
             "content": (
-                f"[{trimmed_count} предыдущих сообщений опущены "
-                f"из-за ограничения контекста.]"
+                f"[{trimmed_count} previous messages were omitted "
+                f"due to context limit.]"
             ),
         })
 
@@ -448,7 +440,7 @@ def trim_messages_to_fit(messages: list[dict], max_tokens: int) -> list[dict]:
     if last_user_msg and last_user_msg not in result:
         result.append(last_user_msg)
 
-    logger.info("Обрезано: %d→%d сообщений, удалено %d",
+    logger.info("Trimmed: %d->%d messages, removed %d",
                 len(messages), len(result), trimmed_count)
 
     return result
@@ -507,7 +499,7 @@ async def stream_response(text: str, model: str):
         yield "data: [DONE]\n\n"
 
     except asyncio.CancelledError:
-        logger.info("Клиент отключился во время стриминга")
+        logger.info("Client disconnected during streaming")
         return
 
 
@@ -521,7 +513,7 @@ async def wait_for_rate_limit() -> None:
     wait_time = RATE_LIMIT_INTERVAL - elapsed
 
     if wait_time > 0:
-        logger.info("Rate limit: ожидание %.0f сек...", wait_time)
+        logger.info("Rate limit: waiting %.0fs...", wait_time)
         await asyncio.sleep(wait_time)
 
 
@@ -532,9 +524,8 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
         for attempt in range(1, MAX_RETRIES + 1):
             await wait_for_rate_limit()
 
-            # Логируем попытку только если это повтор (retry)
             if attempt > 1:
-                logger.info("Повторная попытка %d/%d...", attempt, MAX_RETRIES)
+                logger.info("Retry %d/%d...", attempt, MAX_RETRIES)
 
             try:
                 response = await http_client.post(
@@ -549,16 +540,16 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
                     },
                 )
             except httpx.TimeoutException:
-                logger.error("Таймаут (%dс)", UPSTREAM_TIMEOUT)
+                logger.error("Timeout (%ds)", UPSTREAM_TIMEOUT)
                 raise HTTPException(
                     status_code=504,
-                    detail=f"ApiFreeLLM не ответил за {UPSTREAM_TIMEOUT} секунд.",
+                    detail=f"ApiFreeLLM did not respond within {UPSTREAM_TIMEOUT} seconds.",
                 )
             except httpx.HTTPError as exc:
-                logger.error("Сетевая ошибка: %s", exc)
+                logger.error("Network error: %s", exc)
                 raise HTTPException(
                     status_code=502,
-                    detail="Не удалось подключиться к ApiFreeLLM.",
+                    detail="Could not connect to ApiFreeLLM.",
                 )
 
             last_request_time = time.monotonic()
@@ -571,15 +562,15 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
                     retry_after = RATE_LIMIT_INTERVAL
 
                 if attempt < MAX_RETRIES:
-                    logger.warning("429 Rate limit, жду %dс...", retry_after)
+                    logger.warning("429 Rate limit, waiting %ds...", retry_after)
                     await asyncio.sleep(retry_after)
                     last_request_time = time.monotonic()
                     continue
                 else:
-                    logger.error("429: все %d попыток исчерпаны", MAX_RETRIES)
+                    logger.error("429: all %d attempts exhausted", MAX_RETRIES)
                     raise HTTPException(
                         status_code=429,
-                        detail="ApiFreeLLM перегружен. Попробуйте через 30 секунд.",
+                        detail="ApiFreeLLM is overloaded. Try again in 30 seconds.",
                     )
 
             if response.status_code != 200:
@@ -587,29 +578,29 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
                              response.status_code, response.text[:200])
                 raise HTTPException(
                     status_code=response.status_code,
-                    detail=f"Ошибка от ApiFreeLLM ({response.status_code}): "
+                    detail=f"ApiFreeLLM error ({response.status_code}): "
                            f"{response.text[:300]}",
                 )
 
             try:
                 result_json = response.json()
             except Exception:
-                logger.error("Невалидный JSON от upstream")
+                logger.error("Invalid JSON from upstream")
                 raise HTTPException(
                     status_code=502,
-                    detail="ApiFreeLLM вернул невалидный JSON.",
+                    detail="ApiFreeLLM returned invalid JSON.",
                 )
 
             if not result_json.get("success", False):
-                logger.warning("success=false от upstream")
+                logger.warning("success=false from upstream")
                 raise HTTPException(
                     status_code=502,
-                    detail="ApiFreeLLM сообщил об ошибке.",
+                    detail="ApiFreeLLM reported an error.",
                 )
 
             return {"text": result_json.get("response", "")}
 
-    raise HTTPException(status_code=500, detail="Неожиданная ошибка.")
+    raise HTTPException(status_code=500, detail="Unexpected error.")
 
 
 # ====== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======
@@ -780,50 +771,50 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <body>
     <div class="container">
         <header>
-            <h1>🔌 ApiFreeLLM Proxy</h1>
+            <h1>ApiFreeLLM Proxy</h1>
             <div class="status-badge">
                 <div class="status-dot"></div>
-                Работает • <span id="uptime">—</span>
+                Running | <span id="uptime">-</span>
             </div>
         </header>
 
         <div class="grid">
             <div class="card">
-                <div class="card-label">Запросов обработано</div>
-                <div class="card-value green" id="total-requests">—</div>
+                <div class="card-label">Requests processed</div>
+                <div class="card-value green" id="total-requests">-</div>
                 <div class="card-sub">
-                    <span id="failed-requests">0</span> ошибок •
-                    <span id="filtered-requests">0</span> отфильтровано
+                    <span id="failed-requests">0</span> errors |
+                    <span id="filtered-requests">0</span> filtered
                 </div>
             </div>
 
             <div class="card">
-                <div class="card-label">Среднее время ответа</div>
-                <div class="card-value blue" id="avg-time">—</div>
-                <div class="card-sub">Rate limit: __RATE_LIMIT__с между запросами</div>
+                <div class="card-label">Avg response time</div>
+                <div class="card-value blue" id="avg-time">-</div>
+                <div class="card-sub">Rate limit: __RATE_LIMIT__s between requests</div>
             </div>
 
             <div class="card wide-card">
-                <div class="card-label">Токены использовано (приблизительно)</div>
-                <div class="card-value accent" id="total-tokens">—</div>
+                <div class="card-label">Tokens used (approximate)</div>
+                <div class="card-value accent" id="total-tokens">-</div>
                 <div class="token-bar">
                     <div class="token-bar-fill" id="token-bar" style="width: 0%"></div>
                 </div>
                 <div class="token-details">
-                    <span>📤 Промпт: <strong id="prompt-tokens">0</strong></span>
-                    <span>📥 Ответ: <strong id="completion-tokens">0</strong></span>
-                    <span>📊 Контекст обрезан: <strong id="truncations">0</strong> раз</span>
+                    <span>Prompt: <strong id="prompt-tokens">0</strong></span>
+                    <span>Completion: <strong id="completion-tokens">0</strong></span>
+                    <span>Context trimmed: <strong id="truncations">0</strong>x</span>
                 </div>
             </div>
 
             <div class="card">
-                <div class="card-label">Лимит контекста</div>
+                <div class="card-label">Context limit</div>
                 <div class="card-value orange">__CONTEXT_LIMIT__</div>
-                <div class="card-sub">Резерв на ответ: __RESPONSE_RESERVE__</div>
+                <div class="card-sub">Response reserve: __RESPONSE_RESERVE__</div>
             </div>
 
             <div class="card">
-                <div class="card-label">Модель</div>
+                <div class="card-label">Model</div>
                 <div class="card-value" style="font-size: 20px; color: #ce93d8;"
                     id="model-name">__MODEL__</div>
                 <div class="card-sub">ApiFreeLLM Free Tier</div>
@@ -831,20 +822,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
 
         <div class="setup-card">
-            <h3>⚙️ Настройки для клиента</h3>
+            <h3>Client settings</h3>
             <div class="setup-row">
                 <span class="setup-label">API URL</span>
                 <span class="setup-value" onclick="copyText(this)"
                     >http://localhost:__PORT__/v1</span>
             </div>
             <div class="setup-row">
-                <span class="setup-label">Полный эндпоинт</span>
+                <span class="setup-label">Full endpoint</span>
                 <span class="setup-value" onclick="copyText(this)"
                     >http://localhost:__PORT__/v1/chat/completions</span>
             </div>
             <div class="setup-row">
                 <span class="setup-label">API Key</span>
-                <span class="setup-value" onclick="copyText(this)">любой-текст</span>
+                <span class="setup-value" onclick="copyText(this)">any-text</span>
             </div>
             <div class="setup-row">
                 <span class="setup-label">Model</span>
@@ -853,8 +844,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </div>
 
         <div class="footer">
-            <a href="/docs">📖 API Docs</a> •
-            <a href="/v1/stats">📊 Stats JSON</a> •
+            <a href="/docs">API Docs</a> |
+            <a href="/v1/stats">Stats JSON</a> |
             <a href="https://apifreellm.com" target="_blank">ApiFreeLLM</a>
         </div>
     </div>
@@ -865,7 +856,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             navigator.clipboard.writeText(text).then(() => {
                 el.classList.add('copied');
                 const orig = el.textContent;
-                el.textContent = '✓ Скопировано';
+                el.textContent = 'Copied!';
                 setTimeout(() => { el.textContent = orig; el.classList.remove('copied'); }, 1500);
             });
         }
@@ -882,7 +873,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 document.getElementById('total-requests').textContent = fmt(d.successful);
                 document.getElementById('failed-requests').textContent = d.failed;
                 document.getElementById('filtered-requests').textContent = d.title_filtered;
-                document.getElementById('avg-time').textContent = d.avg_response_time_seconds + 'с';
+                document.getElementById('avg-time').textContent = d.avg_response_time_seconds + 's';
                 document.getElementById('total-tokens').textContent = d.tokens.total_human;
                 document.getElementById('prompt-tokens').textContent = fmt(d.tokens.prompt);
                 document.getElementById('completion-tokens').textContent = fmt(d.tokens.completion);
@@ -924,28 +915,27 @@ async def proxy_chat(request: Request):
     try:
         data = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Невалидный JSON.")
+        raise HTTPException(status_code=400, detail="Invalid JSON.")
 
     messages = data.get("messages", [])
     if not messages or not isinstance(messages, list):
-        raise HTTPException(status_code=400, detail="Поле 'messages' обязательно.")
+        raise HTTPException(status_code=400, detail="Field 'messages' is required.")
 
     model = data.get("model", DEFAULT_MODEL)
     use_stream = data.get("stream", False)
 
-    # Компактный лог: одна строка вместо N строк на каждое сообщение
     total_content_len = sum(
         len(extract_text_content(m.get("content", ""))) for m in messages
     )
     logger.info(
-        "[#%d] Запрос: %d сообщений, ~%d символов, stream=%s",
+        "[#%d] Request: %d messages, ~%d chars, stream=%s",
         req_id, len(messages), total_content_len, use_stream,
     )
 
-    # --- Генерация названия чата ---
+    # --- Title generation ---
     if is_title_generation_request(messages):
         title = generate_smart_title(messages)
-        logger.info("[#%d] → Название чата: '%s'", req_id, title)
+        logger.info("[#%d] Chat title: '%s'", req_id, title)
         proxy_stats.record_title_filtered()
 
         if use_stream:
@@ -966,19 +956,19 @@ async def proxy_chat(request: Request):
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
 
-    # --- Сжатие контекста ---
+    # --- Context trimming ---
     trimmed_messages = trim_messages_to_fit(messages, MAX_PROMPT_TOKENS)
 
-    # --- Формируем промпт ---
+    # --- Build prompt ---
     prompt = build_prompt_from_messages(trimmed_messages)
 
     if not prompt.strip():
-        raise HTTPException(status_code=400, detail="Все сообщения пустые.")
+        raise HTTPException(status_code=400, detail="All messages are empty.")
 
     prompt_tokens = estimate_tokens(prompt)
-    logger.info("[#%d] → Промпт: ~%d токенов", req_id, prompt_tokens)
+    logger.info("[#%d] Prompt: ~%d tokens", req_id, prompt_tokens)
 
-    # --- Отправляем в API ---
+    # --- Send to API ---
     start_time = time.monotonic()
 
     try:
@@ -992,7 +982,7 @@ async def proxy_chat(request: Request):
     proxy_stats.record_success(elapsed, prompt_tokens, completion_tokens)
 
     logger.info(
-        "[#%d] ✓ Ответ: ~%d токенов за %.1fс (сессия: ~%s)",
+        "[#%d] Response: ~%d tokens in %.1fs (session: ~%s)",
         req_id, completion_tokens, elapsed,
         _format_tokens(proxy_stats.total_tokens),
     )
@@ -1051,4 +1041,5 @@ if __name__ == "__main__":
         host=config["server"]["host"],
         port=config["server"]["port"],
         log_level="info",
+        access_log=False,
     )
