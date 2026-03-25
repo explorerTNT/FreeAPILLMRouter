@@ -127,7 +127,7 @@ jobs:
     needs: [build-windows, build-macos]
 
     steps:
-      # Скачиваем оба артефакта (Windows + macOS)
+      # Скачиваем оба артефакта (Windows + macOS + Linux)
       - name: Скачивание артефактов
         uses: actions/download-artifact@v4
         with:
