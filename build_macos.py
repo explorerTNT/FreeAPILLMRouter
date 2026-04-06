@@ -42,6 +42,7 @@ os.chdir(project_dir)
 app_py = str(project_dir / "app.py")
 main_py = str(project_dir / "main.py")
 config_py = str(project_dir / "config.py")
+tool_emulation_py = str(project_dir / "tool_emulation.py")
 icon_png = project_dir / "icon.png"
 icon_icns = project_dir / "icon.icns"
 dist_dir = str(project_dir / "dist")
@@ -53,16 +54,17 @@ print(f"\nФайлы проекта:")
 print(f"  app.py: {Path(app_py).exists()}")
 print(f"  main.py: {Path(main_py).exists()}")
 print(f"  config.py: {Path(config_py).exists()}")
+print(f"  tool_emulation.py: {Path(tool_emulation_py).exists()}")
 print(f"  icon.png: {icon_png.exists()}")
 
 try:
-    # --- Конвертируем PNG → ICNS ---
+    # --- Конвертируем PNG -> ICNS ---
     if not icon_png.exists():
         print(f"Ошибка: {icon_png} не найден!")
         print("Положи icon.png в папку проекта и запусти снова.")
         sys.exit(1)
 
-    print("\nКонвертирую icon.png → icon.icns...")
+    print("\nКонвертирую icon.png -> icon.icns...")
     img = Image.open(icon_png).convert("RGBA")
     img.save(icon_icns, format="ICNS")
     print("Иконка готова!")
@@ -79,6 +81,7 @@ try:
         f"--icon={str(icon_icns)}",
         f"--add-data={main_py}:.",
         f"--add-data={config_py}:.",
+        f"--add-data={tool_emulation_py}:.",
         f"--add-data={str(icon_png)}:.",
         f"--distpath={dist_dir}",
         f"--workpath={build_dir}",
@@ -117,6 +120,7 @@ try:
         "--hidden-import=pydantic_core",
         "--hidden-import=pystray",
         "--hidden-import=pystray._darwin",
+        "--hidden-import=tool_emulation",
 
         "--collect-all=uvicorn",
         "--collect-all=fastapi",

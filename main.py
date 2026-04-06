@@ -11,6 +11,7 @@
 - Подсчёт использованных токенов (приблизительный)
 - Умное сжатие контекста при превышении 32k токенов
 - Веб-панель мониторинга с реальной статистикой
+- Эмуляция tool calling для CCR / Claude Code
 """
 
 import asyncio
@@ -28,6 +29,7 @@ import uvicorn
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 import httpx
+import tool_emulation
 
 # Настраиваем логирование
 logging.basicConfig(
@@ -96,6 +98,8 @@ class ProxyStats:
     successful_requests: int = 0
     failed_requests: int = 0
     title_requests_filtered: int = 0
+    tool_call_requests: int = 0
+    tool_calls_emulated: int = 0
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
     response_times: list[float] = field(default_factory=list)
@@ -127,6 +131,14 @@ class ProxyStats:
     def record_truncation(self) -> None:
         self.context_truncations += 1
 
+    def record_tool_request(self) -> None:
+        """Записывает что запрос содержал инструменты."""
+        self.tool_call_requests += 1
+
+    def record_tool_emulated(self) -> None:
+        """Записывает что мы успешно эмулировали вызов инструмента."""
+        self.tool_calls_emulated += 1
+
     @property
     def total_tokens(self) -> int:
         return self.total_prompt_tokens + self.total_completion_tokens
@@ -149,6 +161,10 @@ class ProxyStats:
             "successful": self.successful_requests,
             "failed": self.failed_requests,
             "title_filtered": self.title_requests_filtered,
+            "tool_calls": {
+                "requests_with_tools": self.tool_call_requests,
+                "successfully_emulated": self.tool_calls_emulated,
+            },
             "tokens": {
                 "prompt": self.total_prompt_tokens,
                 "completion": self.total_completion_tokens,
@@ -216,6 +232,7 @@ async def lifespan(application: FastAPI):
                 RATE_LIMIT_INTERVAL,
                 CONTEXT_LIMIT_TOKENS // 1000,
                 RESPONSE_RESERVE_TOKENS // 1000)
+    logger.info("Tool emulation: ENABLED")
     logger.info("Dashboard: http://localhost:%d/", SERVER_PORT)
     logger.info("API Docs: http://localhost:%d/docs", SERVER_PORT)
     logger.info("=" * 50)
@@ -225,14 +242,15 @@ async def lifespan(application: FastAPI):
     if http_client:
         await http_client.aclose()
 
-    logger.info("Session ended: %d requests, ~%s tokens",
+    logger.info("Session ended: %d requests, ~%s tokens, %d tool calls emulated",
                 proxy_stats.total_requests,
-                _format_tokens(proxy_stats.total_tokens))
+                _format_tokens(proxy_stats.total_tokens),
+                proxy_stats.tool_calls_emulated)
 
 
 app = FastAPI(
     title="ApiFreeLLM Proxy",
-    description="OpenAI-compatible proxy for ApiFreeLLM",
+    description="OpenAI-compatible proxy for ApiFreeLLM with tool calling emulation",
     version="2.0.0",
     lifespan=lifespan,
 )
@@ -361,9 +379,42 @@ def _trim_title(text: str) -> str:
 
 # ====== УМНОЕ СЖАТИЕ КОНТЕКСТА ======
 
-def trim_messages_to_fit(messages: list[dict], max_tokens: int) -> list[dict]:
+def trim_messages_to_fit(
+    messages: list[dict],
+    max_tokens: int,
+    reserved_for_tools: int = 0,
+) -> list[dict]:
+    """
+    Обрезает историю сообщений чтобы уложиться в лимит токенов.
+
+    Приоритет сохранения (от высшего к низшему):
+    1. System prompt — инструкции нельзя терять
+    2. Последнее сообщение пользователя — текущий вопрос/задача
+    3. Свежие сообщения — от конца к началу
+
+    Args:
+        messages: список сообщений
+        max_tokens: максимум токенов для сообщений
+        reserved_for_tools: сколько токенов зарезервировано для описания
+                            инструментов (tools_prompt). Эти токены вычитаются
+                            из бюджета ДО обрезки сообщений, чтобы итоговый
+                            промпт (messages + tools) не превысил лимит.
+    """
     if not messages:
         return messages
+
+    # Вычитаем резерв для инструментов из бюджета сообщений
+    effective_max = max_tokens - reserved_for_tools
+
+    # Защита: если инструменты съели почти весь бюджет,
+    # оставляем минимум для хотя бы одного сообщения
+    if effective_max < 500:
+        logger.warning(
+            "Tools reserve (%d) leaves only %d tokens for messages, "
+            "forcing minimum 500",
+            reserved_for_tools, effective_max,
+        )
+        effective_max = 500
 
     msg_tokens = []
     for msg in messages:
@@ -372,11 +423,15 @@ def trim_messages_to_fit(messages: list[dict], max_tokens: int) -> list[dict]:
 
     total_tokens = sum(msg_tokens)
 
-    if total_tokens <= max_tokens:
+    if total_tokens <= effective_max:
         return messages
 
     proxy_stats.record_truncation()
-    logger.info("Context: ~%d > %d tokens, trimming...", total_tokens, max_tokens)
+    logger.info(
+        "Context: ~%d tokens (+ ~%d tools = ~%d) > %d limit, trimming...",
+        total_tokens, reserved_for_tools,
+        total_tokens + reserved_for_tools, max_tokens,
+    )
 
     system_msgs = []
     system_tokens = 0
@@ -395,14 +450,16 @@ def trim_messages_to_fit(messages: list[dict], max_tokens: int) -> list[dict]:
 
     reserved_tokens = system_tokens + last_user_tokens + 50
 
-    if reserved_tokens >= max_tokens:
-        logger.warning("System + question exceed limit (%d > %d), sending question only",
-                        reserved_tokens, max_tokens)
+    if reserved_tokens >= effective_max:
+        logger.warning(
+            "System + question exceed limit (%d > %d), sending question only",
+            reserved_tokens, effective_max,
+        )
         if last_user_msg:
             return [last_user_msg]
         return [messages[-1]]
 
-    remaining_budget = max_tokens - reserved_tokens
+    remaining_budget = effective_max - reserved_tokens
 
     dialogue_msgs = []
     dialogue_tokens_list = []
@@ -440,8 +497,17 @@ def trim_messages_to_fit(messages: list[dict], max_tokens: int) -> list[dict]:
     if last_user_msg and last_user_msg not in result:
         result.append(last_user_msg)
 
-    logger.info("Trimmed: %d->%d messages, removed %d",
-                len(messages), len(result), trimmed_count)
+    final_tokens = sum(
+        estimate_tokens(extract_text_content(m.get("content", "")))
+        for m in result
+    )
+    logger.info(
+        "Trimmed: %d->%d messages (removed %d), "
+        "~%d msg tokens + ~%d tools = ~%d total",
+        len(messages), len(result), trimmed_count,
+        final_tokens, reserved_for_tools,
+        final_tokens + reserved_for_tools,
+    )
 
     return result
 
@@ -449,6 +515,7 @@ def trim_messages_to_fit(messages: list[dict], max_tokens: int) -> list[dict]:
 # ====== СТРИМИНГ (SSE) ======
 
 async def stream_response(text: str, model: str):
+    """Стримит обычный текстовый ответ по частям через SSE."""
     completion_id = generate_completion_id()
     created = int(time.time())
 
@@ -503,6 +570,28 @@ async def stream_response(text: str, model: str):
         return
 
 
+async def stream_tool_calls_response(
+    tool_calls: list[dict], model: str
+):
+    """
+    Стримит ответ с tool_calls через SSE.
+    Используется когда модель решила вызвать инструмент
+    и клиент запросил стриминг.
+    """
+    completion_id = generate_completion_id()
+    events = tool_emulation.build_tool_calls_stream_events(
+        tool_calls, model, completion_id
+    )
+
+    try:
+        for event in events:
+            yield event
+            await asyncio.sleep(0.01)
+    except asyncio.CancelledError:
+        logger.info("Client disconnected during tool call streaming")
+        return
+
+
 # ====== UPSTREAM ======
 
 async def wait_for_rate_limit() -> None:
@@ -543,7 +632,8 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
                 logger.error("Timeout (%ds)", UPSTREAM_TIMEOUT)
                 raise HTTPException(
                     status_code=504,
-                    detail=f"ApiFreeLLM did not respond within {UPSTREAM_TIMEOUT} seconds.",
+                    detail=f"ApiFreeLLM did not respond within "
+                           f"{UPSTREAM_TIMEOUT} seconds.",
                 )
             except httpx.HTTPError as exc:
                 logger.error("Network error: %s", exc)
@@ -554,28 +644,58 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
 
             last_request_time = time.monotonic()
 
+            # Ретрай при 503 — API временно недоступен.
+            # Ждём как при 429 и пробуем снова.
+            if response.status_code == 503:
+                if attempt < MAX_RETRIES:
+                    logger.warning(
+                        "503 Service unavailable, retrying in %ds...",
+                        RATE_LIMIT_INTERVAL,
+                    )
+                    await asyncio.sleep(RATE_LIMIT_INTERVAL)
+                    last_request_time = time.monotonic()
+                    continue
+                else:
+                    logger.error(
+                        "503: all %d attempts exhausted", MAX_RETRIES
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="ApiFreeLLM is temporarily unavailable. "
+                               "Try again later.",
+                    )
+
             if response.status_code == 429:
                 try:
                     error_data = response.json()
-                    retry_after = error_data.get("retryAfter", RATE_LIMIT_INTERVAL)
+                    retry_after = error_data.get(
+                        "retryAfter", RATE_LIMIT_INTERVAL
+                    )
                 except Exception:
                     retry_after = RATE_LIMIT_INTERVAL
 
                 if attempt < MAX_RETRIES:
-                    logger.warning("429 Rate limit, waiting %ds...", retry_after)
+                    logger.warning(
+                        "429 Rate limit, waiting %ds...", retry_after
+                    )
                     await asyncio.sleep(retry_after)
                     last_request_time = time.monotonic()
                     continue
                 else:
-                    logger.error("429: all %d attempts exhausted", MAX_RETRIES)
+                    logger.error(
+                        "429: all %d attempts exhausted", MAX_RETRIES
+                    )
                     raise HTTPException(
                         status_code=429,
-                        detail="ApiFreeLLM is overloaded. Try again in 30 seconds.",
+                        detail="ApiFreeLLM is overloaded. "
+                               "Try again in 30 seconds.",
                     )
 
             if response.status_code != 200:
-                logger.error("Upstream %d: %s",
-                             response.status_code, response.text[:200])
+                logger.error(
+                    "Upstream %d: %s",
+                    response.status_code, response.text[:200],
+                )
                 raise HTTPException(
                     status_code=response.status_code,
                     detail=f"ApiFreeLLM error ({response.status_code}): "
@@ -605,7 +725,21 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
 
 # ====== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======
 
-def build_prompt_from_messages(messages: list[dict]) -> str:
+def build_prompt_from_messages(
+    messages: list[dict],
+    tools_prompt: str = "",
+) -> str:
+    """
+    Собирает единый текстовый промпт из массива сообщений.
+
+    ApiFreeLLM принимает одно поле 'message' (строка), а не messages[].
+    Эта функция склеивает всю историю диалога в одну строку.
+
+    Args:
+        messages: массив сообщений [{role, content}, ...]
+        tools_prompt: дополнительная системная инструкция для
+                      эмуляции инструментов.
+    """
     if not messages:
         return ""
 
@@ -629,6 +763,10 @@ def build_prompt_from_messages(messages: list[dict]) -> str:
         else:
             label = role_labels.get(role, role.capitalize())
             dialogue_parts.append(f"{label}: {content}")
+
+    # Добавляем инструкцию по инструментам в system prompt
+    if tools_prompt:
+        system_parts.append(tools_prompt)
 
     if not system_parts and len(dialogue_parts) == 1:
         single_msg = dialogue_parts[0]
@@ -717,6 +855,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         .card-value.green { color: #4caf50; }
         .card-value.blue { color: #64b5f6; }
         .card-value.orange { color: #ffb74d; }
+        .card-value.purple { color: #ce93d8; }
 
         .card-sub { font-size: 12px; color: #666; margin-top: 4px; }
         .wide-card { grid-column: 1 / -1; }
@@ -794,6 +933,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <div class="card-sub">Rate limit: __RATE_LIMIT__s between requests</div>
             </div>
 
+            <div class="card">
+                <div class="card-label">Tool calls emulated</div>
+                <div class="card-value purple" id="tool-calls">-</div>
+                <div class="card-sub">
+                    <span id="tool-requests">0</span> requests with tools
+                </div>
+            </div>
+
             <div class="card wide-card">
                 <div class="card-label">Tokens used (approximate)</div>
                 <div class="card-value accent" id="total-tokens">-</div>
@@ -843,6 +990,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             </div>
         </div>
 
+        <div class="setup-card">
+            <h3>CCR (Claude Code Router) settings</h3>
+            <div class="setup-row">
+                <span class="setup-label">api_base_url</span>
+                <span class="setup-value" onclick="copyText(this)"
+                    >http://localhost:__PORT__/v1/chat/completions</span>
+            </div>
+            <div class="setup-row">
+                <span class="setup-label">api_key</span>
+                <span class="setup-value" onclick="copyText(this)">any-text</span>
+            </div>
+            <div class="setup-row">
+                <span class="setup-label">model</span>
+                <span class="setup-value" onclick="copyText(this)">apifreellm</span>
+            </div>
+            <div class="setup-row">
+                <span class="setup-label">transformer</span>
+                <span class="setup-value" style="color: #ffb74d;">not required</span>
+            </div>
+        </div>
+
         <div class="footer">
             <a href="/docs">API Docs</a> |
             <a href="/v1/stats">Stats JSON</a> |
@@ -857,7 +1025,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 el.classList.add('copied');
                 const orig = el.textContent;
                 el.textContent = 'Copied!';
-                setTimeout(() => { el.textContent = orig; el.classList.remove('copied'); }, 1500);
+                setTimeout(() => {
+                    el.textContent = orig;
+                    el.classList.remove('copied');
+                }, 1500);
             });
         }
 
@@ -873,12 +1044,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 document.getElementById('total-requests').textContent = fmt(d.successful);
                 document.getElementById('failed-requests').textContent = d.failed;
                 document.getElementById('filtered-requests').textContent = d.title_filtered;
-                document.getElementById('avg-time').textContent = d.avg_response_time_seconds + 's';
-                document.getElementById('total-tokens').textContent = d.tokens.total_human;
-                document.getElementById('prompt-tokens').textContent = fmt(d.tokens.prompt);
-                document.getElementById('completion-tokens').textContent = fmt(d.tokens.completion);
-                document.getElementById('truncations').textContent = d.context_truncations;
-                const pct = Math.min((d.tokens.total / 1000000) * 100, 100);
+                document.getElementById('avg-time').textContent =
+                    d.avg_response_time_seconds + 's';
+                document.getElementById('total-tokens').textContent =
+                    d.tokens.total_human;
+                document.getElementById('prompt-tokens').textContent =
+                    fmt(d.tokens.prompt);
+                document.getElementById('completion-tokens').textContent =
+                    fmt(d.tokens.completion);
+                document.getElementById('truncations').textContent =
+                    d.context_truncations;
+                document.getElementById('tool-calls').textContent =
+                    fmt(d.tool_calls.successfully_emulated);
+                document.getElementById('tool-requests').textContent =
+                    d.tool_calls.requests_with_tools;
+                const pct = Math.min(
+                    (d.tokens.total / 1000000) * 100, 100
+                );
                 document.getElementById('token-bar').style.width = pct + '%';
             } catch(e) {}
         }
@@ -898,8 +1080,12 @@ async def dashboard():
     html = html.replace("__PORT__", str(SERVER_PORT))
     html = html.replace("__MODEL__", DEFAULT_MODEL)
     html = html.replace("__RATE_LIMIT__", str(RATE_LIMIT_INTERVAL))
-    html = html.replace("__CONTEXT_LIMIT__", f"{CONTEXT_LIMIT_TOKENS // 1000}k")
-    html = html.replace("__RESPONSE_RESERVE__", f"{RESPONSE_RESERVE_TOKENS // 1000}k")
+    html = html.replace(
+        "__CONTEXT_LIMIT__", f"{CONTEXT_LIMIT_TOKENS // 1000}k"
+    )
+    html = html.replace(
+        "__RESPONSE_RESERVE__", f"{RESPONSE_RESERVE_TOKENS // 1000}k"
+    )
     return HTMLResponse(content=html)
 
 
@@ -919,18 +1105,28 @@ async def proxy_chat(request: Request):
 
     messages = data.get("messages", [])
     if not messages or not isinstance(messages, list):
-        raise HTTPException(status_code=400, detail="Field 'messages' is required.")
+        raise HTTPException(
+            status_code=400, detail="Field 'messages' is required."
+        )
 
     model = data.get("model", DEFAULT_MODEL)
     use_stream = data.get("stream", False)
+
+    # Определяем, есть ли в запросе инструменты (CCR / Claude Code)
+    is_tool_request = tool_emulation.has_tools(data)
+    tools = data.get("tools", [])
 
     total_content_len = sum(
         len(extract_text_content(m.get("content", ""))) for m in messages
     )
     logger.info(
-        "[#%d] Request: %d messages, ~%d chars, stream=%s",
+        "[#%d] Request: %d messages, ~%d chars, stream=%s, tools=%d",
         req_id, len(messages), total_content_len, use_stream,
+        len(tools) if is_tool_request else 0,
     )
+
+    if is_tool_request:
+        proxy_stats.record_tool_request()
 
     # --- Title generation ---
     if is_title_generation_request(messages):
@@ -953,17 +1149,48 @@ async def proxy_chat(request: Request):
                 "message": {"role": "assistant", "content": title},
                 "finish_reason": "stop",
             }],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
         })
 
+    # --- Подготовка сообщений ---
+    # Если в истории есть результаты инструментов (role: "tool"),
+    # конвертируем их в текстовый формат, понятный модели
+    if tool_emulation.has_tool_results(messages):
+        messages = tool_emulation.convert_tool_messages_to_text(messages)
+        logger.info(
+            "[#%d] Converted tool results to text format", req_id
+        )
+
+    # --- Генерируем текстовую инструкцию по инструментам ---
+    # Делаем ЭТО ДО обрезки, чтобы знать сколько токенов зарезервировать
+    tools_prompt = ""
+    tools_token_reserve = 0
+    if is_tool_request:
+        tools_prompt = tool_emulation.build_tools_system_prompt(tools)
+        tools_token_reserve = estimate_tokens(tools_prompt)
+        logger.info(
+            "[#%d] Tool emulation: %d tools -> ~%d tokens reserved",
+            req_id, len(tools), tools_token_reserve,
+        )
+
     # --- Context trimming ---
-    trimmed_messages = trim_messages_to_fit(messages, MAX_PROMPT_TOKENS)
+    # Передаём резерв для инструментов, чтобы обрезка учитывала
+    # что tools_prompt займёт часть бюджета
+    trimmed_messages = trim_messages_to_fit(
+        messages, MAX_PROMPT_TOKENS, reserved_for_tools=tools_token_reserve
+    )
 
     # --- Build prompt ---
-    prompt = build_prompt_from_messages(trimmed_messages)
+    prompt = build_prompt_from_messages(trimmed_messages, tools_prompt)
 
     if not prompt.strip():
-        raise HTTPException(status_code=400, detail="All messages are empty.")
+        raise HTTPException(
+            status_code=400, detail="All messages are empty."
+        )
 
     prompt_tokens = estimate_tokens(prompt)
     logger.info("[#%d] Prompt: ~%d tokens", req_id, prompt_tokens)
@@ -978,9 +1205,48 @@ async def proxy_chat(request: Request):
         raise
 
     elapsed = time.monotonic() - start_time
-    completion_tokens = estimate_tokens(result["text"])
+    response_text = result["text"]
+    completion_tokens = estimate_tokens(response_text)
+
+    # --- Анализируем ответ: tool call или обычный текст? ---
+    if is_tool_request:
+        parsed = tool_emulation.parse_tool_calls_from_response(
+            response_text
+        )
+    else:
+        parsed = {"type": "text", "content": response_text}
+
     proxy_stats.record_success(elapsed, prompt_tokens, completion_tokens)
 
+    # --- Ответ с tool_calls ---
+    if parsed["type"] == "tool_calls":
+        tool_calls = parsed["tool_calls"]
+        tool_names = [tc["tool_name"] for tc in tool_calls]
+        proxy_stats.record_tool_emulated()
+
+        logger.info(
+            "[#%d] Tool call emulated: %s (%.1fs, ~%d tokens)",
+            req_id, tool_names, elapsed, completion_tokens,
+        )
+
+        if use_stream:
+            return StreamingResponse(
+                stream_tool_calls_response(tool_calls, model),
+                media_type="text/event-stream",
+            )
+
+        completion_id = generate_completion_id()
+        response_body = tool_emulation.build_tool_calls_response(
+            tool_calls, model, completion_id
+        )
+        response_body["usage"] = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        return JSONResponse(content=response_body)
+
+    # --- Обычный текстовый ответ ---
     logger.info(
         "[#%d] Response: ~%d tokens in %.1fs (session: ~%s)",
         req_id, completion_tokens, elapsed,
@@ -989,7 +1255,7 @@ async def proxy_chat(request: Request):
 
     if use_stream:
         return StreamingResponse(
-            stream_response(result["text"], model),
+            stream_response(parsed["content"], model),
             media_type="text/event-stream",
         )
     return JSONResponse(content={
@@ -999,7 +1265,10 @@ async def proxy_chat(request: Request):
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": result["text"]},
+            "message": {
+                "role": "assistant",
+                "content": parsed["content"],
+            },
             "finish_reason": "stop",
         }],
         "usage": {
@@ -1031,6 +1300,51 @@ async def list_models():
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+@app.get("/v1/debug/tools")
+async def debug_tools():
+    """Показывает размер закешированного tools prompt."""
+    import tool_emulation
+
+    result = []
+    for key, prompt in tool_emulation._tools_prompt_cache.items():
+        tokens = estimate_tokens(prompt)
+
+        # Считаем размер каждого инструмента отдельно
+        tool_sizes = {}
+        for tool_name in sorted(key):
+            # Ищем блок этого инструмента в промпте
+            marker = f"TOOL: {tool_name}\n"
+            start = prompt.find(marker)
+            if start == -1:
+                continue
+            # Ищем начало следующего инструмента или конец блока
+            next_tool = prompt.find("\nTOOL: ", start + 1)
+            if next_tool == -1:
+                # Последний инструмент — ищем конец секции AVAILABLE TOOLS
+                end = prompt.find("\n\nHOW TO CALL", start)
+                if end == -1:
+                    end = start + 500
+            else:
+                end = next_tool
+            block = prompt[start:end]
+            tool_sizes[tool_name] = {
+                "chars": len(block),
+                "tokens": estimate_tokens(block),
+                "first_150": block[:150],
+            }
+
+        result.append({
+            "tools_count": len(key),
+            "prompt_chars": len(prompt),
+            "prompt_tokens": tokens,
+            "tool_sizes": tool_sizes,
+        })
+
+    return {
+        "cache_entries": len(result),
+        "entries": result,
+    }
 
 
 if __name__ == "__main__":

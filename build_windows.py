@@ -9,26 +9,19 @@ import sys
 import traceback
 from pathlib import Path
 
-# [ДОБАВЛЕНО] Принудительно устанавливаем UTF-8 для stdout/stderr.
+# Принудительно устанавливаем UTF-8 для stdout/stderr.
 # GitHub Actions на Windows использует кодировку CP1252,
-# которая не поддерживает кириллицу — print("Привет") вызовет
-# UnicodeEncodeError. Эта настройка решает проблему.
+# которая не поддерживает кириллицу.
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
-# [ДОБАВЛЕНО] Определяем, запущен ли скрипт в CI (GitHub Actions).
-# В CI нет окна которое закроется — лог видно прямо в браузере,
-# поэтому перенаправлять stdout в файл не нужно.
+# Определяем, запущен ли скрипт в CI (GitHub Actions).
 IS_CI = os.environ.get("CI", "false").lower() == "true"
 
 if not IS_CI:
-    # Локальная сборка — перенаправляем в файл как раньше
     log_file = Path(__file__).parent / "build_log.txt"
     sys.stdout = open(log_file, "w", encoding="utf-8")
     sys.stderr = sys.stdout
 else:
-    # CI — оборачиваем stdout в UTF-8, чтобы кириллица не падала.
-    # reconfigure() меняет кодировку уже открытого потока —
-    # это безопаснее чем создавать новый объект.
     log_file = None
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -59,6 +52,7 @@ os.chdir(project_dir)
 app_py = str(project_dir / "app.py")
 main_py = str(project_dir / "main.py")
 config_py = str(project_dir / "config.py")
+tool_emulation_py = str(project_dir / "tool_emulation.py")
 icon_png = project_dir / "icon.png"
 icon_ico = project_dir / "icon.ico"
 dist_dir = str(project_dir / "dist")
@@ -69,10 +63,11 @@ print(f"\nФайлы проекта:")
 print(f"  app.py: {Path(app_py).exists()}")
 print(f"  main.py: {Path(main_py).exists()}")
 print(f"  config.py: {Path(config_py).exists()}")
+print(f"  tool_emulation.py: {Path(tool_emulation_py).exists()}")
 print(f"  icon.png: {icon_png.exists()}")
 
 try:
-    # --- Конвертируем PNG → ICO ---
+    # --- Конвертируем PNG -> ICO ---
     if not icon_png.exists():
         print(f"Ошибка: {icon_png} не найден!")
         sys.exit(1)
@@ -94,6 +89,7 @@ try:
         f"--icon={str(icon_ico)}",
         f"--add-data={main_py};.",
         f"--add-data={config_py};.",
+        f"--add-data={tool_emulation_py};.",
         f"--add-data={str(icon_png)};.",
         f"--distpath={dist_dir}",
         f"--workpath={build_dir}",
@@ -152,6 +148,7 @@ try:
         "--hidden-import=json",
         "--hidden-import=re",
         "--hidden-import=email.mime.text",
+        "--hidden-import=tool_emulation",
         "--collect-all=uvicorn",
         "--collect-all=fastapi",
         "--collect-all=starlette",
@@ -171,15 +168,11 @@ except Exception as e:
     sys.exit(1)
 
 finally:
-    # Убираем временный .ico
     if icon_ico.exists():
         icon_ico.unlink()
 
-    # Закрываем лог только если мы его открывали (не CI)
     if not IS_CI and log_file is not None:
         sys.stdout.close()
-
-        # Выводим сообщение в реальную консоль
         sys.__stdout__.write(f"\nЛог сборки сохранён в: {log_file}\n")
         sys.__stdout__.write("Открой этот файл чтобы увидеть результат.\n")
         sys.__stdout__.flush()
