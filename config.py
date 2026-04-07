@@ -62,7 +62,7 @@ DEFAULT_CONFIG = {
         "host": "0.0.0.0",
         "port": 8000,
     },
-    "upstream_timeout_seconds": 60,
+    "upstream_timeout_seconds": 180,
 }
 
 
