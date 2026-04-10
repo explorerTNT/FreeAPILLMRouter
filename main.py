@@ -15,6 +15,7 @@
 """
 
 import asyncio
+import hashlib
 import itertools
 import json
 import re
@@ -31,7 +32,6 @@ from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 import httpx
 import tool_emulation
 
-# Настраиваем логирование
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -40,7 +40,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ====== НАСТРОЙКИ (заполняются при старте сервера) ======
+# ====== НАСТРОЙКИ ======
 API_KEY: str = ""
 API_ENDPOINT: str = ""
 DEFAULT_MODEL: str = "apifreellm"
@@ -54,10 +54,7 @@ last_request_time: float = 0.0
 RATE_LIMIT_INTERVAL = 25
 MAX_RETRIES = 3
 
-# Переиспользуемый HTTP-клиент
 http_client: httpx.AsyncClient | None = None
-
-# Потокобезопасный счётчик запросов
 _request_id_generator = itertools.count(1)
 
 # ====== ЛИМИТ КОНТЕКСТА ======
@@ -65,53 +62,226 @@ CONTEXT_LIMIT_TOKENS = 32_000
 RESPONSE_RESERVE_TOKENS = 4_000
 MAX_PROMPT_TOKENS = CONTEXT_LIMIT_TOKENS - RESPONSE_RESERVE_TOKENS
 
+# ====== ДЕТЕКТОР ЦИКЛА ======
+LOOP_DETECTION_THRESHOLD = 3
+LOOP_SESSION_TTL = 600
+
 
 # ====== ПОДСЧЁТ ТОКЕНОВ ======
 
 def estimate_tokens(text: str) -> int:
-    """
-    Приблизительная оценка количества токенов в тексте.
-    Кириллица дороже (~2 символа/токен), латиница (~4 символа/токен).
-    """
     if not text:
         return 0
-
     cyrillic_count = sum(1 for ch in text if '\u0400' <= ch <= '\u04ff')
     total_chars = len(text)
-
     if total_chars == 0:
         return 0
-
     cyrillic_ratio = cyrillic_count / total_chars
     chars_per_token = 2.0 * cyrillic_ratio + 4.0 * (1.0 - cyrillic_ratio)
     estimated = int(total_chars / chars_per_token * 1.1)
-
     return max(estimated, 1)
+
+
+# ====== ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ДЕТЕКТОРА ЦИКЛА ======
+
+def _last_tool_result_is_error(messages: list[dict]) -> bool:
+    """
+    Проверяет содержит ли последний tool result сообщение об ошибке.
+
+    Используется детектором цикла чтобы НЕ блокировать Read/Write
+    когда модель восстанавливается после упавшего Edit.
+    """
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = extract_text_content(msg.get("content", ""))
+        if not content.startswith("[Tool Result"):
+            continue
+        content_lower = content.lower()
+        error_markers = [
+            "error", "not found", "failed", "cannot",
+            "no such file", "string not found",
+            "file must be read first", "exception",
+        ]
+        return any(marker in content_lower for marker in error_markers)
+    return False
+
+
+# ====== ДЕТЕКТОР ЗАЦИКЛИВАНИЯ ======
+
+@dataclass
+class _ToolCallRecord:
+    tool_name: str
+    args_hash: str
+
+
+@dataclass
+class _AgentSession:
+    call_counts: dict[str, int] = field(default_factory=dict)
+    call_arg_hashes: dict[str, set] = field(default_factory=dict)
+    last_active: float = field(default_factory=time.monotonic)
+    pressure_count: int = 0
+
+
+class LoopDetector:
+    """
+    Отслеживает паттерны зацикливания агента.
+
+    Read/Write после ошибки инструмента — это НЕ цикл,
+    это нормальное восстановление. Детектор пропускает такие случаи.
+    """
+
+    def __init__(self):
+        self._sessions: dict[str, _AgentSession] = {}
+
+    def _get_session(self, conv_id: str) -> _AgentSession:
+        now = time.monotonic()
+        if conv_id in self._sessions:
+            session = self._sessions[conv_id]
+            if now - session.last_active > LOOP_SESSION_TTL:
+                logger.info(
+                    "Loop detector: session %s expired, resetting", conv_id
+                )
+                self._sessions[conv_id] = _AgentSession()
+        else:
+            self._sessions[conv_id] = _AgentSession()
+        self._sessions[conv_id].last_active = now
+        self._cleanup_old_sessions()
+        return self._sessions[conv_id]
+
+    def _cleanup_old_sessions(self) -> None:
+        if len(self._sessions) < 50:
+            return
+        now = time.monotonic()
+        stale = [
+            k for k, v in self._sessions.items()
+            if now - v.last_active > LOOP_SESSION_TTL
+        ]
+        for key in stale:
+            del self._sessions[key]
+
+    @staticmethod
+    def _hash_args(arguments: dict | list) -> str:
+        canonical = json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+        return hashlib.md5(canonical.encode()).hexdigest()[:8]
+
+    def record_tool_calls(self, conv_id: str, tool_calls: list[dict]) -> None:
+        session = self._get_session(conv_id)
+        for tc in tool_calls:
+            name = tc.get("tool_name", "unknown")
+            args = tc.get("arguments", {})
+            args_hash = self._hash_args(args)
+            session.call_counts[name] = session.call_counts.get(name, 0) + 1
+            if name not in session.call_arg_hashes:
+                session.call_arg_hashes[name] = set()
+            session.call_arg_hashes[name].add(args_hash)
+
+    def check_and_build_warning(
+        self, conv_id: str, messages: list[dict],
+    ) -> str:
+        session = self._get_session(conv_id)
+        warnings = []
+
+        last_result_is_error = _last_tool_result_is_error(messages)
+        recovery_tools = {"Read", "Write"}
+
+        for tool_name, count in session.call_counts.items():
+            if count >= LOOP_DETECTION_THRESHOLD:
+                if tool_name in recovery_tools and last_result_is_error:
+                    logger.debug(
+                        "Loop detector: skipping %s (recovery after error)",
+                        tool_name,
+                    )
+                    continue
+                warnings.append(
+                    f"- You have already called '{tool_name}' "
+                    f"{count} times in this session."
+                )
+
+        for tool_name, hashes in session.call_arg_hashes.items():
+            count = session.call_counts.get(tool_name, 0)
+            if count > len(hashes) and count >= 2:
+                if tool_name in recovery_tools and last_result_is_error:
+                    logger.debug(
+                        "Loop detector: skipping %s same-args "
+                        "(recovery after error)", tool_name,
+                    )
+                    continue
+                warnings.append(
+                    f"- You have called '{tool_name}' with the same "
+                    f"arguments more than once."
+                )
+
+        if not warnings:
+            return ""
+
+        session.pressure_count += 1
+
+        if session.pressure_count >= 3:
+            directive = (
+                "STOP using tools. You have enough information. "
+                "Write the final code changes NOW using Write or Edit tools, "
+                "or provide your final answer as plain text."
+            )
+        else:
+            directive = (
+                "You likely already have the information you need. "
+                "Stop searching and start making the actual changes. "
+                "Use Write or Edit tools to apply fixes."
+            )
+
+        warning_text = (
+            "[LOOP DETECTED]\n"
+            "You appear to be repeating the same actions:\n"
+            + "\n".join(warnings) + "\n\n"
+            + directive
+        )
+
+        logger.warning(
+            "Loop detected for session %s: %s (pressure #%d)",
+            conv_id, warnings, session.pressure_count,
+        )
+
+        return warning_text
+
+    def reset_session(self, conv_id: str) -> None:
+        if conv_id in self._sessions:
+            del self._sessions[conv_id]
+
+
+loop_detector = LoopDetector()
+
+
+def get_conversation_id(messages: list[dict]) -> str:
+    for msg in messages:
+        if msg.get("role") == "user":
+            content = extract_text_content(msg.get("content", ""))
+            seed = content[:200]
+            return hashlib.md5(seed.encode()).hexdigest()[:12]
+    all_content = "".join(
+        extract_text_content(m.get("content", "")) for m in messages
+    )
+    return hashlib.md5(all_content[:500].encode()).hexdigest()[:12]
 
 
 # ====== СТАТИСТИКА ======
 
 @dataclass
 class ProxyStats:
-    """Статистика работы прокси-сервера."""
     total_requests: int = 0
     successful_requests: int = 0
     failed_requests: int = 0
     title_requests_filtered: int = 0
     tool_call_requests: int = 0
     tool_calls_emulated: int = 0
+    loop_detections: int = 0
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
     response_times: list[float] = field(default_factory=list)
     context_truncations: int = 0
     start_time: float = field(default_factory=time.time)
 
-    def record_success(
-        self,
-        response_time: float,
-        prompt_tokens: int,
-        completion_tokens: int,
-    ) -> None:
+    def record_success(self, response_time, prompt_tokens, completion_tokens):
         self.total_requests += 1
         self.successful_requests += 1
         self.total_prompt_tokens += prompt_tokens
@@ -120,40 +290,41 @@ class ProxyStats:
         if len(self.response_times) > 100:
             self.response_times.pop(0)
 
-    def record_failure(self) -> None:
+    def record_failure(self):
         self.total_requests += 1
         self.failed_requests += 1
 
-    def record_title_filtered(self) -> None:
+    def record_title_filtered(self):
         self.total_requests += 1
         self.title_requests_filtered += 1
 
-    def record_truncation(self) -> None:
+    def record_truncation(self):
         self.context_truncations += 1
 
-    def record_tool_request(self) -> None:
-        """Записывает что запрос содержал инструменты."""
+    def record_tool_request(self):
         self.tool_call_requests += 1
 
-    def record_tool_emulated(self) -> None:
-        """Записывает что мы успешно эмулировали вызов инструмента."""
+    def record_tool_emulated(self):
         self.tool_calls_emulated += 1
 
+    def record_loop_detection(self):
+        self.loop_detections += 1
+
     @property
-    def total_tokens(self) -> int:
+    def total_tokens(self):
         return self.total_prompt_tokens + self.total_completion_tokens
 
     @property
-    def avg_response_time(self) -> float:
+    def avg_response_time(self):
         if not self.response_times:
             return 0.0
         return statistics.mean(self.response_times)
 
     @property
-    def uptime_seconds(self) -> float:
+    def uptime_seconds(self):
         return time.time() - self.start_time
 
-    def to_dict(self) -> dict:
+    def to_dict(self):
         return {
             "uptime_seconds": round(self.uptime_seconds, 1),
             "uptime_human": _format_duration(self.uptime_seconds),
@@ -164,6 +335,7 @@ class ProxyStats:
             "tool_calls": {
                 "requests_with_tools": self.tool_call_requests,
                 "successfully_emulated": self.tool_calls_emulated,
+                "loop_detections": self.loop_detections,
             },
             "tokens": {
                 "prompt": self.total_prompt_tokens,
@@ -198,7 +370,7 @@ def _format_tokens(tokens: int) -> str:
 proxy_stats = ProxyStats()
 
 
-# ====== ЖИЗНЕННЫЙ ЦИКЛ ПРИЛОЖЕНИЯ ======
+# ====== ЖИЗНЕННЫЙ ЦИКЛ ======
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
@@ -233,6 +405,8 @@ async def lifespan(application: FastAPI):
                 CONTEXT_LIMIT_TOKENS // 1000,
                 RESPONSE_RESERVE_TOKENS // 1000)
     logger.info("Tool emulation: ENABLED")
+    logger.info("Loop detection: threshold=%d, session_ttl=%ds",
+                LOOP_DETECTION_THRESHOLD, LOOP_SESSION_TTL)
     logger.info("Dashboard: http://localhost:%d/", SERVER_PORT)
     logger.info("API Docs: http://localhost:%d/docs", SERVER_PORT)
     logger.info("=" * 50)
@@ -242,21 +416,25 @@ async def lifespan(application: FastAPI):
     if http_client:
         await http_client.aclose()
 
-    logger.info("Session ended: %d requests, ~%s tokens, %d tool calls emulated",
-                proxy_stats.total_requests,
-                _format_tokens(proxy_stats.total_tokens),
-                proxy_stats.tool_calls_emulated)
+    logger.info(
+        "Session ended: %d requests, ~%s tokens, %d tool calls, "
+        "%d loops detected",
+        proxy_stats.total_requests,
+        _format_tokens(proxy_stats.total_tokens),
+        proxy_stats.tool_calls_emulated,
+        proxy_stats.loop_detections,
+    )
 
 
 app = FastAPI(
     title="ApiFreeLLM Proxy",
     description="OpenAI-compatible proxy for ApiFreeLLM with tool calling emulation",
-    version="2.0.0",
+    version="2.3.0",
     lifespan=lifespan,
 )
 
 
-# ====== ИЗВЛЕЧЕНИЕ ТЕКСТА ИЗ CONTENT ======
+# ====== ИЗВЛЕЧЕНИЕ ТЕКСТА ======
 
 def extract_text_content(content) -> str:
     if content is None:
@@ -280,15 +458,11 @@ def extract_text_content(content) -> str:
 def is_title_generation_request(messages: list[dict]) -> bool:
     if not messages:
         return False
-
     last_msg = messages[-1]
     last_content = extract_text_content(last_msg.get("content", ""))
-
     if len(last_content) > 1000:
         return False
-
     last_content_lower = last_content.lower()
-
     title_markers = [
         "give this conversation a name",
         "give a short name",
@@ -301,29 +475,24 @@ def is_title_generation_request(messages: list[dict]) -> bool:
         "summarize this conversation",
         "generate a title",
     ]
-
     return any(marker in last_content_lower for marker in title_markers)
 
 
 def generate_smart_title(messages: list[dict]) -> str:
     last_content = extract_text_content(messages[-1].get("content", ""))
-
     user_text = _extract_from_code_block(last_content)
     if user_text:
         return _trim_title(user_text)
-
     for msg in messages:
         role = msg.get("role", "")
         content = extract_text_content(msg.get("content", ""))
         if role == "user" and content and not _is_title_instruction(content):
             return _trim_title(content)
-
     for msg in messages:
         role = msg.get("role", "")
         content = extract_text_content(msg.get("content", ""))
         if role == "assistant" and content:
             return _trim_title(content)
-
     return "New chat"
 
 
@@ -358,18 +527,14 @@ def _trim_title(text: str) -> str:
     first_line = text.strip().split("\n")[0].strip()
     first_line = re.sub(r"[*_`#]", "", first_line)
     first_line = first_line.strip("\"'`")
-
     for char in ["\u00ab", "\u00bb", "\u201e", "\u201c", "\u201d",
                  "\u2018", "\u2019"]:
         first_line = first_line.strip(char)
-
     for prefix in ["User:", "user:", "Human:", "human:"]:
         if first_line.startswith(prefix):
             first_line = first_line[len(prefix):].strip()
-
     words = first_line.split()
     title = " ".join(words[:6]) + ("..." if len(words) > 6 else "")
-
     if len(title) < 2:
         return "New chat"
     if len(title) > 50:
@@ -384,30 +549,11 @@ def trim_messages_to_fit(
     max_tokens: int,
     reserved_for_tools: int = 0,
 ) -> list[dict]:
-    """
-    Обрезает историю сообщений чтобы уложиться в лимит токенов.
-
-    Приоритет сохранения (от высшего к низшему):
-    1. System prompt — инструкции нельзя терять
-    2. Последнее сообщение пользователя — текущий вопрос/задача
-    3. Свежие сообщения — от конца к началу
-
-    Args:
-        messages: список сообщений
-        max_tokens: максимум токенов для сообщений
-        reserved_for_tools: сколько токенов зарезервировано для описания
-                            инструментов (tools_prompt). Эти токены вычитаются
-                            из бюджета ДО обрезки сообщений, чтобы итоговый
-                            промпт (messages + tools) не превысил лимит.
-    """
     if not messages:
         return messages
 
-    # Вычитаем резерв для инструментов из бюджета сообщений
     effective_max = max_tokens - reserved_for_tools
 
-    # Защита: если инструменты съели почти весь бюджет,
-    # оставляем минимум для хотя бы одного сообщения
     if effective_max < 500:
         logger.warning(
             "Tools reserve (%d) leaves only %d tokens for messages, "
@@ -471,6 +617,7 @@ def trim_messages_to_fit(
 
     kept_msgs = []
     kept_tokens = 0
+
     for i in range(len(dialogue_msgs) - 1, -1, -1):
         if dialogue_msgs[i] is last_user_msg:
             continue
@@ -480,7 +627,6 @@ def trim_messages_to_fit(
         kept_tokens += dialogue_tokens_list[i]
 
     trimmed_count = len(dialogue_msgs) - len(kept_msgs) - 1
-
     result = list(system_msgs)
 
     if trimmed_count > 0:
@@ -512,28 +658,22 @@ def trim_messages_to_fit(
     return result
 
 
-# ====== СТРИМИНГ (SSE) ======
+# ====== СТРИМИНГ ======
 
 async def stream_response(text: str, model: str):
-    """Стримит обычный текстовый ответ по частям через SSE."""
     completion_id = generate_completion_id()
     created = int(time.time())
-
     first_chunk = {
         "id": completion_id,
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
-        "choices": [{
-            "index": 0,
-            "delta": {"role": "assistant", "content": ""},
-            "finish_reason": None,
-        }],
+        "choices": [{"index": 0,
+                     "delta": {"role": "assistant", "content": ""},
+                     "finish_reason": None}],
     }
-
     try:
         yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
-
         chunk_size = 5
         for i in range(0, len(text), chunk_size):
             piece = text[i:i + chunk_size]
@@ -542,47 +682,31 @@ async def stream_response(text: str, model: str):
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": piece},
-                    "finish_reason": None,
-                }],
+                "choices": [{"index": 0,
+                             "delta": {"content": piece},
+                             "finish_reason": None}],
             }
             yield f"data: {json.dumps(content_chunk, ensure_ascii=False)}\n\n"
             await asyncio.sleep(0.02)
-
         stop_chunk = {
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop",
-            }],
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
         }
         yield f"data: {json.dumps(stop_chunk, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
-
     except asyncio.CancelledError:
         logger.info("Client disconnected during streaming")
         return
 
 
-async def stream_tool_calls_response(
-    tool_calls: list[dict], model: str
-):
-    """
-    Стримит ответ с tool_calls через SSE.
-    Используется когда модель решила вызвать инструмент
-    и клиент запросил стриминг.
-    """
+async def stream_tool_calls_response(tool_calls: list[dict], model: str):
     completion_id = generate_completion_id()
     events = tool_emulation.build_tool_calls_stream_events(
         tool_calls, model, completion_id
     )
-
     try:
         for event in events:
             yield event
@@ -596,11 +720,9 @@ async def stream_tool_calls_response(
 
 async def wait_for_rate_limit() -> None:
     global last_request_time
-
     now = time.monotonic()
     elapsed = now - last_request_time
     wait_time = RATE_LIMIT_INTERVAL - elapsed
-
     if wait_time > 0:
         logger.info("Rate limit: waiting %.0fs...", wait_time)
         await asyncio.sleep(wait_time)
@@ -623,10 +745,7 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
                         "Authorization": f"Bearer {API_KEY}",
                         "Content-Type": "application/json",
                     },
-                    json={
-                        "message": prompt,
-                        "model": model,
-                    },
+                    json={"message": prompt, "model": model},
                 )
             except httpx.TimeoutException:
                 logger.error("Timeout (%ds)", UPSTREAM_TIMEOUT)
@@ -644,8 +763,6 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
 
             last_request_time = time.monotonic()
 
-            # Ретрай при 503 — API временно недоступен.
-            # Ждём как при 429 и пробуем снова.
             if response.status_code == 503:
                 if attempt < MAX_RETRIES:
                     logger.warning(
@@ -656,13 +773,10 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
                     last_request_time = time.monotonic()
                     continue
                 else:
-                    logger.error(
-                        "503: all %d attempts exhausted", MAX_RETRIES
-                    )
+                    logger.error("503: all %d attempts exhausted", MAX_RETRIES)
                     raise HTTPException(
                         status_code=503,
-                        detail="ApiFreeLLM is temporarily unavailable. "
-                               "Try again later.",
+                        detail="ApiFreeLLM is temporarily unavailable.",
                     )
 
             if response.status_code == 429:
@@ -682,13 +796,10 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
                     last_request_time = time.monotonic()
                     continue
                 else:
-                    logger.error(
-                        "429: all %d attempts exhausted", MAX_RETRIES
-                    )
+                    logger.error("429: all %d attempts exhausted", MAX_RETRIES)
                     raise HTTPException(
                         status_code=429,
-                        detail="ApiFreeLLM is overloaded. "
-                               "Try again in 30 seconds.",
+                        detail="ApiFreeLLM is overloaded. Try again in 30s.",
                     )
 
             if response.status_code != 200:
@@ -723,50 +834,36 @@ async def send_to_upstream(prompt: str, model: str) -> dict:
     raise HTTPException(status_code=500, detail="Unexpected error.")
 
 
-# ====== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======
+# ====== СБОРКА ПРОМПТА ======
 
 def build_prompt_from_messages(
     messages: list[dict],
     tools_prompt: str = "",
+    loop_warning: str = "",
 ) -> str:
-    """
-    Собирает единый текстовый промпт из массива сообщений.
-
-    ApiFreeLLM принимает одно поле 'message' (строка), а не messages[].
-    Эта функция склеивает всю историю диалога в одну строку.
-
-    Args:
-        messages: массив сообщений [{role, content}, ...]
-        tools_prompt: дополнительная системная инструкция для
-                      эмуляции инструментов.
-    """
     if not messages:
         return ""
 
     system_parts = []
     dialogue_parts = []
-
-    role_labels = {
-        "user": "User",
-        "assistant": "Assistant",
-    }
+    role_labels = {"user": "User", "assistant": "Assistant"}
 
     for msg in messages:
         role = msg.get("role", "user")
         content = extract_text_content(msg.get("content", ""))
-
         if not content.strip():
             continue
-
         if role == "system":
             system_parts.append(content)
         else:
             label = role_labels.get(role, role.capitalize())
             dialogue_parts.append(f"{label}: {content}")
 
-    # Добавляем инструкцию по инструментам в system prompt
     if tools_prompt:
         system_parts.append(tools_prompt)
+
+    if loop_warning:
+        system_parts.append(loop_warning)
 
     if not system_parts and len(dialogue_parts) == 1:
         single_msg = dialogue_parts[0]
@@ -797,21 +894,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <title>ApiFreeLLM Proxy</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI',
                          Roboto, 'Helvetica Neue', sans-serif;
-            background: #0f0f1a;
-            color: #e0e0e0;
-            min-height: 100vh;
-            padding: 24px;
+            background: #0f0f1a; color: #e0e0e0;
+            min-height: 100vh; padding: 24px;
         }
-
         .container { max-width: 720px; margin: 0 auto; }
-
         header { text-align: center; margin-bottom: 32px; }
         header h1 { font-size: 28px; color: #fff; margin-bottom: 8px; }
-
         .status-badge {
             display: inline-flex; align-items: center; gap: 8px;
             background: rgba(76, 175, 80, 0.15);
@@ -819,68 +910,53 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             border-radius: 20px; padding: 6px 16px;
             font-size: 14px; color: #4caf50;
         }
-
         .status-dot {
             width: 8px; height: 8px; border-radius: 50%;
-            background: #4caf50;
-            animation: pulse 2s ease-in-out infinite;
+            background: #4caf50; animation: pulse 2s ease-in-out infinite;
         }
-
         @keyframes pulse {
             0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(76,175,80,0.4); }
             50% { opacity: 0.7; box-shadow: 0 0 0 8px rgba(76,175,80,0); }
         }
-
         .grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
             gap: 16px; margin-bottom: 24px;
         }
-
         .card {
             background: #1a1a2e; border: 1px solid #2a2a3e;
-            border-radius: 12px; padding: 20px;
-            transition: border-color 0.2s;
+            border-radius: 12px; padding: 20px; transition: border-color 0.2s;
         }
         .card:hover { border-color: #3a3a5e; }
-
         .card-label {
-            font-size: 12px; color: #888;
-            text-transform: uppercase; letter-spacing: 0.5px;
-            margin-bottom: 8px;
+            font-size: 12px; color: #888; text-transform: uppercase;
+            letter-spacing: 0.5px; margin-bottom: 8px;
         }
-
         .card-value { font-size: 32px; font-weight: 700; color: #fff; }
         .card-value.accent { color: #e94560; }
         .card-value.green { color: #4caf50; }
         .card-value.blue { color: #64b5f6; }
         .card-value.orange { color: #ffb74d; }
         .card-value.purple { color: #ce93d8; }
-
         .card-sub { font-size: 12px; color: #666; margin-top: 4px; }
         .wide-card { grid-column: 1 / -1; }
-
         .token-bar {
             margin-top: 12px; background: #2a2a3e;
             border-radius: 6px; height: 8px; overflow: hidden;
         }
         .token-bar-fill {
-            height: 100%; border-radius: 6px;
-            transition: width 0.5s ease;
+            height: 100%; border-radius: 6px; transition: width 0.5s ease;
             background: linear-gradient(90deg, #4caf50, #ffb74d, #e94560);
         }
-
         .token-details {
             display: flex; justify-content: space-between;
             margin-top: 8px; font-size: 12px; color: #888;
         }
-
         .setup-card {
             background: #1a1a2e; border: 1px solid #2a2a3e;
             border-radius: 12px; padding: 24px; margin-top: 24px;
         }
         .setup-card h3 { color: #fff; margin-bottom: 16px; font-size: 16px; }
-
         .setup-row {
             display: flex; justify-content: space-between;
             align-items: center; padding: 8px 0;
@@ -888,17 +964,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         }
         .setup-row:last-child { border-bottom: none; }
         .setup-label { color: #888; font-size: 14px; }
-
         .setup-value {
             font-family: 'SF Mono', 'Fira Code', monospace;
-            font-size: 13px; color: #64b5f6;
-            background: #0f0f1a; padding: 4px 12px;
-            border-radius: 6px; cursor: pointer;
+            font-size: 13px; color: #64b5f6; background: #0f0f1a;
+            padding: 4px 12px; border-radius: 6px; cursor: pointer;
             border: 1px solid transparent; transition: border-color 0.2s;
         }
         .setup-value:hover { border-color: #64b5f6; }
         .setup-value.copied { border-color: #4caf50; color: #4caf50; }
-
         .footer {
             text-align: center; margin-top: 32px;
             font-size: 12px; color: #444;
@@ -916,7 +989,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 Running | <span id="uptime">-</span>
             </div>
         </header>
-
         <div class="grid">
             <div class="card">
                 <div class="card-label">Requests processed</div>
@@ -926,21 +998,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     <span id="filtered-requests">0</span> filtered
                 </div>
             </div>
-
             <div class="card">
                 <div class="card-label">Avg response time</div>
                 <div class="card-value blue" id="avg-time">-</div>
                 <div class="card-sub">Rate limit: __RATE_LIMIT__s between requests</div>
             </div>
-
             <div class="card">
                 <div class="card-label">Tool calls emulated</div>
                 <div class="card-value purple" id="tool-calls">-</div>
                 <div class="card-sub">
-                    <span id="tool-requests">0</span> requests with tools
+                    <span id="tool-requests">0</span> requests with tools |
+                    <span id="loop-detections">0</span> loops broken
                 </div>
             </div>
-
             <div class="card wide-card">
                 <div class="card-label">Tokens used (approximate)</div>
                 <div class="card-value accent" id="total-tokens">-</div>
@@ -953,21 +1023,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     <span>Context trimmed: <strong id="truncations">0</strong>x</span>
                 </div>
             </div>
-
             <div class="card">
                 <div class="card-label">Context limit</div>
                 <div class="card-value orange">__CONTEXT_LIMIT__</div>
                 <div class="card-sub">Response reserve: __RESPONSE_RESERVE__</div>
             </div>
-
             <div class="card">
-                <div class="card-label">Model</div>
                 <div class="card-value" style="font-size: 20px; color: #ce93d8;"
                     id="model-name">__MODEL__</div>
                 <div class="card-sub">ApiFreeLLM Free Tier</div>
             </div>
         </div>
-
         <div class="setup-card">
             <h3>Client settings</h3>
             <div class="setup-row">
@@ -989,7 +1055,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <span class="setup-value" onclick="copyText(this)">__MODEL__</span>
             </div>
         </div>
-
         <div class="setup-card">
             <h3>CCR (Claude Code Router) settings</h3>
             <div class="setup-row">
@@ -1010,14 +1075,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <span class="setup-value" style="color: #ffb74d;">not required</span>
             </div>
         </div>
-
         <div class="footer">
             <a href="/docs">API Docs</a> |
             <a href="/v1/stats">Stats JSON</a> |
             <a href="https://apifreellm.com" target="_blank">ApiFreeLLM</a>
         </div>
     </div>
-
     <script>
         function copyText(el) {
             const text = el.textContent;
@@ -1025,17 +1088,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 el.classList.add('copied');
                 const orig = el.textContent;
                 el.textContent = 'Copied!';
-                setTimeout(() => {
-                    el.textContent = orig;
-                    el.classList.remove('copied');
-                }, 1500);
+                setTimeout(() => { el.textContent = orig; el.classList.remove('copied'); }, 1500);
             });
         }
-
         function fmt(n) {
             return n.toString().replace(/\\B(?=(\\d{3})+(?!\\d))/g, ' ');
         }
-
         async function updateStats() {
             try {
                 const r = await fetch('/v1/stats');
@@ -1044,27 +1102,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 document.getElementById('total-requests').textContent = fmt(d.successful);
                 document.getElementById('failed-requests').textContent = d.failed;
                 document.getElementById('filtered-requests').textContent = d.title_filtered;
-                document.getElementById('avg-time').textContent =
-                    d.avg_response_time_seconds + 's';
-                document.getElementById('total-tokens').textContent =
-                    d.tokens.total_human;
-                document.getElementById('prompt-tokens').textContent =
-                    fmt(d.tokens.prompt);
-                document.getElementById('completion-tokens').textContent =
-                    fmt(d.tokens.completion);
-                document.getElementById('truncations').textContent =
-                    d.context_truncations;
-                document.getElementById('tool-calls').textContent =
-                    fmt(d.tool_calls.successfully_emulated);
-                document.getElementById('tool-requests').textContent =
-                    d.tool_calls.requests_with_tools;
-                const pct = Math.min(
-                    (d.tokens.total / 1000000) * 100, 100
-                );
+                document.getElementById('avg-time').textContent = d.avg_response_time_seconds + 's';
+                document.getElementById('total-tokens').textContent = d.tokens.total_human;
+                document.getElementById('prompt-tokens').textContent = fmt(d.tokens.prompt);
+                document.getElementById('completion-tokens').textContent = fmt(d.tokens.completion);
+                document.getElementById('truncations').textContent = d.context_truncations;
+                document.getElementById('tool-calls').textContent = fmt(d.tool_calls.successfully_emulated);
+                document.getElementById('tool-requests').textContent = d.tool_calls.requests_with_tools;
+                document.getElementById('loop-detections').textContent = d.tool_calls.loop_detections;
+                const pct = Math.min((d.tokens.total / 1000000) * 100, 100);
                 document.getElementById('token-bar').style.width = pct + '%';
             } catch(e) {}
         }
-
         updateStats();
         setInterval(updateStats, 3000);
     </script>
@@ -1080,12 +1129,8 @@ async def dashboard():
     html = html.replace("__PORT__", str(SERVER_PORT))
     html = html.replace("__MODEL__", DEFAULT_MODEL)
     html = html.replace("__RATE_LIMIT__", str(RATE_LIMIT_INTERVAL))
-    html = html.replace(
-        "__CONTEXT_LIMIT__", f"{CONTEXT_LIMIT_TOKENS // 1000}k"
-    )
-    html = html.replace(
-        "__RESPONSE_RESERVE__", f"{RESPONSE_RESERVE_TOKENS // 1000}k"
-    )
+    html = html.replace("__CONTEXT_LIMIT__", f"{CONTEXT_LIMIT_TOKENS // 1000}k")
+    html = html.replace("__RESPONSE_RESERVE__", f"{RESPONSE_RESERVE_TOKENS // 1000}k")
     return HTMLResponse(content=html)
 
 
@@ -1105,14 +1150,10 @@ async def proxy_chat(request: Request):
 
     messages = data.get("messages", [])
     if not messages or not isinstance(messages, list):
-        raise HTTPException(
-            status_code=400, detail="Field 'messages' is required."
-        )
+        raise HTTPException(status_code=400, detail="Field 'messages' is required.")
 
     model = data.get("model", DEFAULT_MODEL)
     use_stream = data.get("stream", False)
-
-    # Определяем, есть ли в запросе инструменты (CCR / Claude Code)
     is_tool_request = tool_emulation.has_tools(data)
     tools = data.get("tools", [])
 
@@ -1128,12 +1169,10 @@ async def proxy_chat(request: Request):
     if is_tool_request:
         proxy_stats.record_tool_request()
 
-    # --- Title generation ---
     if is_title_generation_request(messages):
         title = generate_smart_title(messages)
         logger.info("[#%d] Chat title: '%s'", req_id, title)
         proxy_stats.record_title_filtered()
-
         if use_stream:
             return StreamingResponse(
                 stream_response(title, model),
@@ -1144,29 +1183,18 @@ async def proxy_chat(request: Request):
             "object": "chat.completion",
             "created": int(time.time()),
             "model": model,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": title},
-                "finish_reason": "stop",
-            }],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-            },
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": title},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
 
-    # --- Подготовка сообщений ---
-    # Если в истории есть результаты инструментов (role: "tool"),
-    # конвертируем их в текстовый формат, понятный модели
+    conv_id = get_conversation_id(messages)
+
     if tool_emulation.has_tool_results(messages):
         messages = tool_emulation.convert_tool_messages_to_text(messages)
-        logger.info(
-            "[#%d] Converted tool results to text format", req_id
-        )
+        logger.info("[#%d] Converted tool results to text format", req_id)
 
-    # --- Генерируем текстовую инструкцию по инструментам ---
-    # Делаем ЭТО ДО обрезки, чтобы знать сколько токенов зарезервировать
     tools_prompt = ""
     tools_token_reserve = 0
     if is_tool_request:
@@ -1177,27 +1205,26 @@ async def proxy_chat(request: Request):
             req_id, len(tools), tools_token_reserve,
         )
 
-    # --- Context trimming ---
-    # Передаём резерв для инструментов, чтобы обрезка учитывала
-    # что tools_prompt займёт часть бюджета
+    loop_warning = ""
+    if is_tool_request:
+        loop_warning = loop_detector.check_and_build_warning(conv_id, messages)
+        if loop_warning:
+            proxy_stats.record_loop_detection()
+            tools_token_reserve += estimate_tokens(loop_warning)
+
     trimmed_messages = trim_messages_to_fit(
         messages, MAX_PROMPT_TOKENS, reserved_for_tools=tools_token_reserve
     )
 
-    # --- Build prompt ---
-    prompt = build_prompt_from_messages(trimmed_messages, tools_prompt)
+    prompt = build_prompt_from_messages(trimmed_messages, tools_prompt, loop_warning)
 
     if not prompt.strip():
-        raise HTTPException(
-            status_code=400, detail="All messages are empty."
-        )
+        raise HTTPException(status_code=400, detail="All messages are empty.")
 
     prompt_tokens = estimate_tokens(prompt)
     logger.info("[#%d] Prompt: ~%d tokens", req_id, prompt_tokens)
 
-    # --- Send to API ---
     start_time = time.monotonic()
-
     try:
         result = await send_to_upstream(prompt, model)
     except HTTPException:
@@ -1206,23 +1233,28 @@ async def proxy_chat(request: Request):
 
     elapsed = time.monotonic() - start_time
     response_text = result["text"]
+
+    # Дебаг-лог — увеличен до 1500 символов чтобы видеть полный JSON с закрывающим ```
+    if is_tool_request:
+        logger.info(
+            "[#%d] RAW response (first 1500 chars): %r",
+            req_id, response_text[:1500],
+        )
+
     completion_tokens = estimate_tokens(response_text)
 
-    # --- Анализируем ответ: tool call или обычный текст? ---
     if is_tool_request:
-        parsed = tool_emulation.parse_tool_calls_from_response(
-            response_text
-        )
+        parsed = tool_emulation.parse_tool_calls_from_response(response_text)
     else:
         parsed = {"type": "text", "content": response_text}
 
     proxy_stats.record_success(elapsed, prompt_tokens, completion_tokens)
 
-    # --- Ответ с tool_calls ---
     if parsed["type"] == "tool_calls":
         tool_calls = parsed["tool_calls"]
         tool_names = [tc["tool_name"] for tc in tool_calls]
         proxy_stats.record_tool_emulated()
+        loop_detector.record_tool_calls(conv_id, tool_calls)
 
         logger.info(
             "[#%d] Tool call emulated: %s (%.1fs, ~%d tokens)",
@@ -1246,7 +1278,6 @@ async def proxy_chat(request: Request):
         }
         return JSONResponse(content=response_body)
 
-    # --- Обычный текстовый ответ ---
     logger.info(
         "[#%d] Response: ~%d tokens in %.1fs (session: ~%s)",
         req_id, completion_tokens, elapsed,
@@ -1263,14 +1294,10 @@ async def proxy_chat(request: Request):
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": parsed["content"],
-            },
-            "finish_reason": "stop",
-        }],
+        "choices": [{"index": 0,
+                     "message": {"role": "assistant",
+                                 "content": parsed["content"]},
+                     "finish_reason": "stop"}],
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -1288,12 +1315,8 @@ async def proxy_chat_alt(request: Request):
 async def list_models():
     return {
         "object": "list",
-        "data": [{
-            "id": DEFAULT_MODEL,
-            "object": "model",
-            "created": 0,
-            "owned_by": "apifreellm",
-        }],
+        "data": [{"id": DEFAULT_MODEL, "object": "model",
+                  "created": 0, "owned_by": "apifreellm"}],
     }
 
 
@@ -1301,27 +1324,20 @@ async def list_models():
 async def health_check():
     return {"status": "ok"}
 
+
 @app.get("/v1/debug/tools")
 async def debug_tools():
-    """Показывает размер закешированного tools prompt."""
-    import tool_emulation
-
     result = []
     for key, prompt in tool_emulation._tools_prompt_cache.items():
         tokens = estimate_tokens(prompt)
-
-        # Считаем размер каждого инструмента отдельно
         tool_sizes = {}
         for tool_name in sorted(key):
-            # Ищем блок этого инструмента в промпте
             marker = f"TOOL: {tool_name}\n"
             start = prompt.find(marker)
             if start == -1:
                 continue
-            # Ищем начало следующего инструмента или конец блока
             next_tool = prompt.find("\nTOOL: ", start + 1)
             if next_tool == -1:
-                # Последний инструмент — ищем конец секции AVAILABLE TOOLS
                 end = prompt.find("\n\nHOW TO CALL", start)
                 if end == -1:
                     end = start + 500
@@ -1333,17 +1349,35 @@ async def debug_tools():
                 "tokens": estimate_tokens(block),
                 "first_150": block[:150],
             }
-
         result.append({
             "tools_count": len(key),
             "prompt_chars": len(prompt),
             "prompt_tokens": tokens,
             "tool_sizes": tool_sizes,
         })
+    return {"cache_entries": len(result), "entries": result}
 
+
+@app.get("/v1/debug/loops")
+async def debug_loops():
+    sessions_info = []
+    now = time.monotonic()
+    for conv_id, session in loop_detector._sessions.items():
+        age = now - session.last_active
+        sessions_info.append({
+            "conversation_id": conv_id,
+            "age_seconds": round(age, 1),
+            "call_counts": session.call_counts,
+            "pressure_count": session.pressure_count,
+            "unique_arg_sets": {
+                k: len(v) for k, v in session.call_arg_hashes.items()
+            },
+        })
     return {
-        "cache_entries": len(result),
-        "entries": result,
+        "active_sessions": len(sessions_info),
+        "loop_detection_threshold": LOOP_DETECTION_THRESHOLD,
+        "session_ttl_seconds": LOOP_SESSION_TTL,
+        "sessions": sessions_info,
     }
 
 
